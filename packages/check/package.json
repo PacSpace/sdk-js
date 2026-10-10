@@ -1,0 +1,44 @@
+{
+  "name": "@pacspace-io/check",
+  "version": "0.3.0",
+  "description": "Checks a PacSpace record history file against the public source. Runs without PacSpace.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "pacspace-check": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "clean": "rm -rf dist",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
+  },
+  "devDependencies": {
+    "@pacspace/shared": "^1.0.0",
+    "esbuild": "^0.25.11",
+    "typescript": "^5.3.0",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "keywords": [
+    "pacspace",
+    "record",
+    "check",
+    "history"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

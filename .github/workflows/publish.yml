@@ -1,0 +1,102 @@
+name: Publish npm packages
+
+# Written by pacspace-api's scripts/sdk/npm-mirror/sync.mjs; edit it there.
+# A tag sdk-vX.Y.Z publishes @pacspace-io/sdk and check-vX.Y.Z publishes
+# @pacspace-io/check, through the npm environment, by trusted publishing with
+# provenance. A manual run builds, compares and packs both, and publishes
+# nothing.
+
+on:
+  push:
+    tags:
+      - 'sdk-v*'
+      - 'check-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: The built files match pacspace-api's build
+        run: npm run check:dist
+
+      - name: Pack both packages
+        run: |
+          npm pack --dry-run -w @pacspace-io/sdk
+          npm pack --dry-run -w @pacspace-io/check
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/sdk-v') || startsWith(github.ref, 'refs/tags/check-v')) }}
+    environment:
+      name: npm
+      url: https://www.npmjs.com/org/pacspace-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Choose the package the tag names
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            sdk-v*) dir=packages/sdk; version="${TAG#sdk-v}" ;;
+            check-v*) dir=packages/check; version="${TAG#check-v}" ;;
+            *) echo "unexpected tag $TAG"; exit 1 ;;
+          esac
+          actual="$(node -p "require('./$dir/package.json').version")"
+          if [ "$actual" != "$version" ]; then
+            echo "$TAG names $version; $dir/package.json is $actual"
+            exit 1
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: The built files match pacspace-api's build
+        run: npm run check:dist
+
+      - name: Publish
+        working-directory: ${{ steps.tag.outputs.dir }}
+        run: npx -y npm@11.21.0 publish --provenance --access public
+
+  dry-run:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Confirm dry run
+        run: echo "Both packages built, compared and packed. Nothing published."

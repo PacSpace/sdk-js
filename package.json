@@ -1,0 +1,22 @@
+{
+  "name": "pacspace-sdk-js",
+  "private": true,
+  "workspaces": [
+    "packages/shared",
+    "packages/sdk",
+    "packages/check"
+  ],
+  "scripts": {
+    "build": "tsc -p packages/shared/tsconfig.mirror.json && npm run build -w @pacspace-io/sdk && npm run build -w @pacspace-io/check",
+    "check:dist": "node scripts/sdk/npm-mirror/compare-dist.mjs mirror/expected-dist.json"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.11",
+    "typescript": "5.9.3",
+    "@noble/curves": "1.2.0",
+    "@noble/hashes": "1.8.0"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}
