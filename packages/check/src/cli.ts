@@ -33,7 +33,9 @@ import {
   type HistoryFile,
 } from './check';
 import { runOpen } from './open';
-import { checkRelease } from './release';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { checkRelease, DEFAULT_RELEASE_ORIGIN, releaseWords, type RawAnswer, type RawGet, type ReleaseAnchor } from './release';
 import { renderReport, TOO_LARGE_SENTENCE } from './report';
 
 export interface CliArgs {
@@ -56,6 +58,7 @@ export const USAGE = `Usage: pacspace-check <history.json> [options]
        pacspace-check <history.json> --key <path>
        pacspace-check open [--link-file <path>] [--access-code-file <path>] [--copy <path>] [--html <path>] [--source <url> | --rpc <url>] [--timeout <ms>] [--json]
        pacspace-check release [--origin <url>] [--source <url> | --rpc <url>] [--timeout <ms>] [--json]
+       pacspace-check release --origin <url> --release-record <record key>,<chain id>,<contract>
 
 Checks a PacSpace record history file: every entry against what was
 committed, the file against its own fingerprint, and the record against
@@ -197,7 +200,52 @@ export interface CliIo {
   writeNewFile?: (path: string, bytes: Uint8Array, mode: number) => Promise<void>;
   now?: () => Date;
   fetchImpl?: typeof fetch;
+  /** `release` reads files as the host sent them; Node's https client unless given. */
+  rawGet?: RawGet;
 }
+
+/** Node's https (or http, for a local host) with no decoding, so a compressed body is read as sent. */
+/** No key-page file comes near this; a larger answer is not read to the end. */
+export const RAW_BODY_LIMIT = 32 * 1024 * 1024;
+
+export const nodeRawGet: RawGet = (url, acceptEncoding, timeoutMs) => {
+  const target = new URL(url);
+  const request = target.protocol === 'http:' ? httpRequest : httpsRequest;
+  return new Promise<RawAnswer>((resolve, reject) => {
+    const sent = request(
+      target,
+      { method: 'GET', headers: { 'accept-encoding': acceptEncoding, 'cache-control': 'no-cache' }, timeout: timeoutMs },
+      (response) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on('data', (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > RAW_BODY_LIMIT) {
+            sent.destroy(new Error('too large'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on('end', () => {
+          clearTimeout(deadline);
+          const headers: Record<string, string> = {};
+          for (const [name, value] of Object.entries(response.headers)) {
+            if (value !== undefined) headers[name.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);
+          }
+          resolve({ status: response.statusCode ?? 0, headers, body: new Uint8Array(Buffer.concat(chunks)) });
+        });
+        response.on('error', reject);
+      },
+    );
+    const deadline = setTimeout(() => sent.destroy(new Error('timeout')), timeoutMs);
+    sent.on('timeout', () => sent.destroy(new Error('timeout')));
+    sent.on('error', (error) => {
+      clearTimeout(deadline);
+      reject(error);
+    });
+    sent.end();
+  });
+};
 
 export class ExitTwo extends Error {}
 
@@ -285,10 +333,20 @@ export interface ReleaseArgs {
   source: CheckOptions['source'];
   timeoutMs: number | undefined;
   json: boolean;
+  releaseRecord: ReleaseAnchor | undefined;
+}
+
+/** `<record key>,<chain id>,<contract>`, or null. */
+export function releaseRecordOf(value: string): ReleaseAnchor | null {
+  const [recordKey, chainId, contractAddress, ...rest] = value.split(',').map((part) => part.trim());
+  if (rest.length || !/^0x[0-9a-fA-F]{64}$/.test(recordKey ?? '') || !/^[1-9][0-9]*$/.test(chainId ?? '') || !/^0x[0-9a-fA-F]{40}$/.test(contractAddress ?? '')) {
+    return null;
+  }
+  return { recordKey: recordKey.toLowerCase(), chainId: Number(chainId), contractAddress: contractAddress.toLowerCase() };
 }
 
 export function parseReleaseArgs(argv: string[]): ReleaseArgs {
-  const args: ReleaseArgs = { origin: undefined, source: 'mirror', timeoutMs: undefined, json: false };
+  const args: ReleaseArgs = { origin: undefined, source: 'mirror', timeoutMs: undefined, json: false, releaseRecord: undefined };
   const takeValue = (flag: string, index: number): string => {
     const value = argv[index + 1];
     if (value === undefined || value.startsWith('--')) throw new UsageError(`${flag} needs a value.`);
@@ -319,6 +377,13 @@ export function parseReleaseArgs(argv: string[]): ReleaseArgs {
       case '--json':
         args.json = true;
         break;
+      case '--release-record': {
+        const record = releaseRecordOf(takeValue(arg, index));
+        if (!record) throw new UsageError('--release-record needs a value.');
+        args.releaseRecord = record;
+        index += 1;
+        break;
+      }
       default:
         throw new UsageError(`Unknown option ${arg}.`);
     }
@@ -341,7 +406,18 @@ async function runRelease(argv: string[], io: CliIo): Promise<number> {
     io.stderr(`${(error as Error).message}\n\n${USAGE}`);
     return 2;
   }
-  const report = await checkRelease({ origin: args.origin, source: args.source, timeoutMs: args.timeoutMs, fetchImpl: io.fetchImpl });
+  if (args.releaseRecord && new URL(args.origin ?? DEFAULT_RELEASE_ORIGIN).origin === DEFAULT_RELEASE_ORIGIN) {
+    io.stderr(`${releaseWords.stagingOnly(args.releaseRecord.recordKey)}\n`);
+    return 2;
+  }
+  const report = await checkRelease({
+    origin: args.origin,
+    source: args.source,
+    timeoutMs: args.timeoutMs,
+    fetchImpl: io.fetchImpl,
+    rawGet: io.rawGet ?? nodeRawGet,
+    releaseRecord: args.releaseRecord,
+  });
   io.stdout(args.json ? `${JSON.stringify(report, null, 2)}\n` : `${report.sentences.join('\n')}\n`);
   return report.exitCode;
 }

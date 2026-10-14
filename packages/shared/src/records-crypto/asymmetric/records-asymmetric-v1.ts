@@ -125,6 +125,12 @@ export function loadRecordsAsymmetricLibrariesV1(): Promise<unknown> {
   return load();
 }
 
+/** @internal The wrap suite's KDF and AEAD factories: hpke's, which run on the platform's WebCrypto. */
+export async function keyWrapSuiteFactoriesV1(): Promise<unknown> {
+  const { hpke } = await load();
+  return { kdf: hpke.KDF_HKDF_SHA256, aead: hpke.AEAD_AES_256_GCM };
+}
+
 async function wrapSuite(ikmE?: Uint8Array) {
   const { hpke, noble, hybrid } = await load();
   const kem = ikmE
@@ -146,7 +152,7 @@ async function wrapSuite(ikmE?: Uint8Array) {
         };
       }
     : noble.KEM_MLKEM768_X25519;
-  const suite = new hpke.CipherSuite(kem, noble.KDF_HKDF_SHA256, noble.AEAD_AES_256_GCM);
+  const suite = new hpke.CipherSuite(kem, hpke.KDF_HKDF_SHA256, hpke.AEAD_AES_256_GCM);
   if (suite.KEM.id !== SUITE.kem || suite.KDF.id !== SUITE.kdf || suite.AEAD.id !== SUITE.aead) {
     throw new RecordsAsymmetricError('KEY_WRAP_SUITE');
   }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 - 2026-10-14
+
+### Changed
+
+- release reads release manifest v2: each file plain and compressed, its headers, and each page's reported-only policy. Key pages released before 0.4.0 carry manifest v1 and do not pass.
+- release checks the production release record pinned in the checker, not the one a host names.
+
+### Added
+
+- --release-record <key>,<chain>,<contract> checks a staging release record; such a run never passes.
+
 ## 0.3.0 - 2026-10-09
 
 ### Added

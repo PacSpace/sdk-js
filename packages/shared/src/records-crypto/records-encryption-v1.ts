@@ -74,9 +74,13 @@ const INSPECT = Symbol.for('nodejs.util.inspect.custom');
 // ------------------------------------------------------------------ key types
 
 const KEY_BYTES_OF = new WeakMap<object, Uint8Array>();
+/** Only this module makes keys, so a key's id is always the one its bytes derive. */
+const MINT: unique symbol = Symbol('records key');
+type Mint = typeof MINT;
 
 abstract class HiddenKey {
-  protected constructor(bytes: Uint8Array) {
+  protected constructor(mint: Mint, bytes: Uint8Array) {
+    if (mint !== MINT) throw new TypeError('records keys are made by their derive and import functions');
     KEY_BYTES_OF.set(this, Uint8Array.from(bytes));
   }
   protected abstract describe(): string;
@@ -94,8 +98,8 @@ abstract class HiddenKey {
 /** The id key, from version 1 of the workspace secret only (wire ids never change across rotations). */
 export class RecordsIdKeyV1 extends HiddenKey {
   /** @internal */
-  constructor(bytes: Uint8Array) {
-    super(bytes);
+  constructor(mint: Mint, bytes: Uint8Array) {
+    super(mint, bytes);
   }
   protected describe(): string {
     return '[records id key]';
@@ -105,8 +109,8 @@ export class RecordsIdKeyV1 extends HiddenKey {
 /** `K_v`: reads every record made under version `version`. */
 export class RecordsKeyV1 extends HiddenKey {
   /** @internal */
-  constructor(bytes: Uint8Array, readonly version: number, readonly id: string) {
-    super(bytes);
+  constructor(mint: Mint, bytes: Uint8Array, readonly version: number, readonly id: string) {
+    super(mint, bytes);
   }
   protected describe(): string {
     return `[records key v${this.version} ${this.id.slice(0, 8)}]`;
@@ -116,8 +120,8 @@ export class RecordsKeyV1 extends HiddenKey {
 /** `W_v`: wraps the workspace's private seed for storage at PacSpace (L2a2). */
 export class RecordsWrapKeyV1 extends HiddenKey {
   /** @internal */
-  constructor(bytes: Uint8Array, readonly version: number, readonly id: string) {
-    super(bytes);
+  constructor(mint: Mint, bytes: Uint8Array, readonly version: number, readonly id: string) {
+    super(mint, bytes);
   }
   protected describe(): string {
     return `[wrap key v${this.version} ${this.id.slice(0, 8)}]`;
@@ -131,8 +135,8 @@ export class RecordsWrapKeyV1 extends HiddenKey {
  */
 export class RecordKeyV1 extends HiddenKey {
   /** @internal */
-  constructor(bytes: Uint8Array, readonly id: string, readonly recordsKeyId: string | null) {
-    super(bytes);
+  constructor(mint: Mint, bytes: Uint8Array, readonly id: string, readonly recordsKeyId: string | null) {
+    super(mint, bytes);
   }
   protected describe(): string {
     return `[record key ${this.id.slice(0, 8)}]`;
@@ -186,7 +190,7 @@ export function generateWorkspaceSecretV1(): Uint8Array {
 /** The id key, from version 1 of the workspace secret. */
 export async function deriveRecordsIdKeyV1(secretV1: Uint8Array): Promise<RecordsIdKeyV1> {
   assertSecret(secretV1, 1);
-  return new RecordsIdKeyV1(await hkdf32(secretV1, new Uint8Array(0), L.idKey));
+  return new RecordsIdKeyV1(MINT, await hkdf32(secretV1, new Uint8Array(0), L.idKey));
 }
 
 /** `K_v` and `W_v` of one version, with their ids. */
@@ -195,8 +199,8 @@ export async function deriveRecordsKeysV1(secret: Uint8Array, version: number): 
   const k = await hkdf32(secret, new Uint8Array(0), L.recordsKey);
   const w = await hkdf32(secret, new Uint8Array(0), L.wrapKey);
   return {
-    recordsKey: new RecordsKeyV1(k, version, await keyIdOf(L.recordsKeyId, k)),
-    wrapKey: new RecordsWrapKeyV1(w, version, await keyIdOf(L.wrapKeyId, w)),
+    recordsKey: new RecordsKeyV1(MINT, k, version, await keyIdOf(L.recordsKeyId, k)),
+    wrapKey: new RecordsWrapKeyV1(MINT, w, version, await keyIdOf(L.wrapKeyId, w)),
   };
 }
 
@@ -226,7 +230,7 @@ function assertBaseKey(base: CryptoKey): void {
 /** The id key, from version 1's stored key (`importWorkspaceSecretKeyV1`). */
 export async function deriveRecordsIdKeyFromBaseV1(baseV1: CryptoKey): Promise<RecordsIdKeyV1> {
   assertBaseKey(baseV1);
-  return new RecordsIdKeyV1(await hkdf32From(baseV1, new Uint8Array(0), L.idKey));
+  return new RecordsIdKeyV1(MINT, await hkdf32From(baseV1, new Uint8Array(0), L.idKey));
 }
 
 /** `K_v` and `W_v` of one version, from its stored key. */
@@ -236,8 +240,8 @@ export async function deriveRecordsKeysFromBaseV1(base: CryptoKey, version: numb
   const k = await hkdf32From(base, new Uint8Array(0), L.recordsKey);
   const w = await hkdf32From(base, new Uint8Array(0), L.wrapKey);
   return {
-    recordsKey: new RecordsKeyV1(k, version, await keyIdOf(L.recordsKeyId, k)),
-    wrapKey: new RecordsWrapKeyV1(w, version, await keyIdOf(L.wrapKeyId, w)),
+    recordsKey: new RecordsKeyV1(MINT, k, version, await keyIdOf(L.recordsKeyId, k)),
+    wrapKey: new RecordsWrapKeyV1(MINT, w, version, await keyIdOf(L.wrapKeyId, w)),
   };
 }
 
@@ -245,7 +249,7 @@ export async function deriveRecordsKeysFromBaseV1(base: CryptoKey, version: numb
 export async function recordKeyOfV1(recordsKey: RecordsKeyV1, wireRecordId: string): Promise<RecordKeyV1> {
   if (!(recordsKey instanceof RecordsKeyV1) || !WIRE_ID.test(wireRecordId)) throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
   const rk = await hkdf32(bytesOf(recordsKey), utf8(wireRecordId), L.recordKey);
-  return new RecordKeyV1(rk, await keyIdOf(L.recordKeyId, rk), recordsKey.id);
+  return new RecordKeyV1(MINT, rk, await keyIdOf(L.recordKeyId, rk), recordsKey.id);
 }
 
 /** `K_v` that arrived in a wrap: 32 bytes, its id recomputed from them. */
@@ -253,7 +257,7 @@ export async function recordsKeyFromBytesV1(bytes: Uint8Array, version: number):
   if (!(bytes instanceof Uint8Array) || bytes.length !== KEY_BYTES || !Number.isSafeInteger(version) || version < 1) {
     throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
   }
-  return new RecordsKeyV1(bytes, version, await keyIdOf(L.recordsKeyId, bytes));
+  return new RecordsKeyV1(MINT, bytes, version, await keyIdOf(L.recordsKeyId, bytes));
 }
 
 /**
@@ -264,7 +268,7 @@ export async function recordsKeyFromBytesV1(bytes: Uint8Array, version: number):
 export async function recordKeyFromBytesV1(bytes: Uint8Array, recordsKeyId: string | null = null): Promise<RecordKeyV1> {
   if (!(bytes instanceof Uint8Array) || bytes.length !== KEY_BYTES) throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
   if (recordsKeyId !== null && !/^[0-9a-f]{64}$/.test(recordsKeyId)) throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
-  return new RecordKeyV1(bytes, await keyIdOf(L.recordKeyId, bytes), recordsKeyId);
+  return new RecordKeyV1(MINT, bytes, await keyIdOf(L.recordKeyId, bytes), recordsKeyId);
 }
 
 // ------------------------------------------------------------------ wire ids and the content tag (N4)
@@ -396,7 +400,7 @@ export function readRecordEnvelopeShapeV1(
 }
 
 export type OpenRecordEntryResultV1 =
-  | { ok: true; content: Record<string, unknown>; saltKey: string; recordsKeyId: string }
+  | { ok: true; content: Record<string, unknown>; saltKey: string; recordsKeyId: string | null }
   | RecordsRefusalV1<'RECORD_ENVELOPE_MALFORMED' | 'RECORD_ENVELOPE_TOO_LARGE' | 'RECORD_ENVELOPE_WRONG_KEY' | 'RECORD_ENVELOPE_AUTH_FAILED' | 'RECORD_ENVELOPE_PADDING'>;
 
 /**
@@ -446,7 +450,7 @@ export async function openRecordEntryEnvelopeV1(input: {
     }
     const content = value.content;
     if (!content || typeof content !== 'object' || Array.isArray(content) || !isHex32(value.saltKey)) return refuse('RECORD_ENVELOPE_PADDING');
-    return { ok: true, content: content as Record<string, unknown>, saltKey: value.saltKey as string, recordsKeyId: shape.kid };
+    return { ok: true, content: content as Record<string, unknown>, saltKey: value.saltKey as string, recordsKeyId: input.keyring ? shape.kid : rk.recordsKeyId };
   } catch {
     return refuse('RECORD_ENVELOPE_PADDING');
   }

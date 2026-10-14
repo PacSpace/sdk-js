@@ -1,5 +1,11 @@
 const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const B64URL_TEXT = /^[A-Za-z0-9_-]*$/;
+/** Character code to 6-bit value: one lookup per character, so decoding a key takes no data-dependent search. */
+const B64URL_VALUE = (() => {
+  const table = new Uint8Array(256);
+  for (let i = 0; i < B64URL.length; i += 1) table[B64URL.charCodeAt(i)] = i;
+  return table;
+})();
 
 /** Unpadded base64url (RFC 4648 section 5). */
 export function toBase64Url(bytes: Uint8Array): string {
@@ -26,7 +32,7 @@ export function fromBase64Url(text: string): Uint8Array | null {
   let acc = 0;
   let o = 0;
   for (let i = 0; i < text.length; i += 1) {
-    acc = (acc << 6) | B64URL.indexOf(text[i]);
+    acc = (acc << 6) | B64URL_VALUE[text.charCodeAt(i) & 0xff];
     bits += 6;
     if (bits >= 8) {
       bits -= 8;

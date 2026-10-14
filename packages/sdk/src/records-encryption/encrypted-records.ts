@@ -348,7 +348,9 @@ export class EncryptedRecords {
     if (!own?.xwingPublicId) return null;
     for (const seedWrap of own.seedWraps ?? []) {
       const opened = await rc.openSeedWrapV1({ wrap: seedWrap.wrap, publicKeyId: own.xwingPublicId, keyring });
-      if (opened.ok) return opened.seed;
+      if (!opened.ok) continue;
+      if (own.xwingPublic !== b64u(opened.seed.publicKey)) break;
+      return opened.seed;
     }
     throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
   }
@@ -366,8 +368,9 @@ export class EncryptedRecords {
     const own = await this.ownIdentity();
     let result: { xwingPublicId: string; code: string; created: boolean };
     if (own?.xwingPublicId && own.xwingPublic) {
-      await this.ownSeed();
-      result = { xwingPublicId: own.xwingPublicId, code: await rc.holderKeyCodeV1(fromB64u(own.xwingPublic)), created: false };
+      const seed = await this.ownSeed();
+      if (!seed) throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
+      result = { xwingPublicId: seed.publicKeyId, code: await rc.holderKeyCodeV1(seed.publicKey), created: false };
     } else {
       const seed = await rc.workspaceSeedFromBytesV1(globalThis.crypto.getRandomValues(new Uint8Array(32)));
       const version = ring.current.version;
@@ -569,7 +572,7 @@ export class EncryptedRecords {
       const seed = await this.ownSeed(ring);
       if (seed) {
         const wrap = await next.rc.sealSeedWrapV1(next.ring.wrapKey(newest)!, seed);
-        await this.client.put(`${ENCRYPTION}/identity`, { xwingPublic: own.xwingPublic, seedWrap: { version: newest, wrap } });
+        await this.client.put(`${ENCRYPTION}/identity`, { xwingPublic: b64u(seed.publicKey), seedWrap: { version: newest, wrap } });
       }
     }
 

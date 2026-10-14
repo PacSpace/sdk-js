@@ -70,6 +70,10 @@ An encrypted record's history is checked with its record key: npx @pacspace-io/c
 
 npx @pacspace-io/check release checks the key pages a host serves against the release record on the ledger.
 
+release reads each file three ways, as the host sends it, and checks each answer and its headers against the production release record pinned in the checker. It proves what the host served to this run, not what it serves anyone else.
+
+--release-record <key>,<chain>,<contract> checks a staging release record instead. Such a run never passes.
+
 ## Options
 
 ```
@@ -82,6 +86,7 @@ npx @pacspace-io/check release checks the key pages a host serves against the re
 --access-code-file <path>  open: read the access code from this file instead of asking
 --copy <path>          open: save a kept copy of what the link shows to a new file
 --html <path>          open: save the report as a page that opens without a network connection
+--release-record <key>,<chain>,<contract>  release: checks a staging release record; such a run never passes
 --offline              check the file alone; do not read the public source
 --source <url>         read the public source from this mirror
 --rpc <url>            read the public source over JSON-RPC at this URL
