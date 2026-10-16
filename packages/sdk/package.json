@@ -1,6 +1,6 @@
 {
   "name": "@pacspace-io/sdk",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Official PacSpace Balance API SDK: TypeScript client for neutral usage-based billing verification and records, with the record check bundled",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

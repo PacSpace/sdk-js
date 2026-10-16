@@ -24,6 +24,7 @@ export type RecordsCrypto = Pick<
   | 'wireRecordIdV1'
   | 'wireReferenceIdV1'
   | 'contentTagV1'
+  | 'contentTagV2'
   | 'recordKeyOfV1'
   | 'recordKeyFromBytesV1'
   | 'exportKeyBytesV1'
@@ -33,6 +34,7 @@ export type RecordsCrypto = Pick<
   | 'checkEncryptedWriteSizeV1'
   | 'newSaltKeyV2'
   | 'commitRecordContentV2'
+  | 'commitRecordContentV3'
 > &
   Pick<
     typeof Asymmetric,
@@ -41,12 +43,14 @@ export type RecordsCrypto = Pick<
     | 'openSeedWrapV1'
     | 'publicKeyIdV1'
     | 'holderKeyCodeV1'
-    | 'wrapRecordsKeyV1'
-    | 'wrapRecordKeyV1'
-    | 'wrapDisclosureKeyV1'
-    | 'unwrapRecordsKeyV1'
-    | 'unwrapRecordKeyV1'
-    | 'unwrapDisclosureKeyV1'
+    | 'KEY_WRAP_OWNER_V2'
+    | 'wrapRecordsKeyV2'
+    | 'wrapRecordKeyV2'
+    | 'wrapDisclosureKeyV2'
+    | 'unwrapRecordsKeyV2'
+    | 'unwrapRecordKeyV2'
+    | 'unwrapDisclosureKeyV2'
+    | 'rotationProofV1'
   >;
 
 let loaded: Promise<RecordsCrypto> | null = null;

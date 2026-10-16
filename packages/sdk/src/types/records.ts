@@ -54,6 +54,8 @@ export interface RecordReadOptions {
   wireRecordId?: string;
   /** A grant on the record, sent in the X-PacSpace-Grant header. */
   grant?: string;
+  /** The owning workspace's id: required with `grant` on an encrypted record; its wrap is bound to it. */
+  owner?: string;
   /** The record's key, as `records.recordKey()` exports it, for a reader with no workspace. */
   recordKey?: string;
   /** The owning workspace's id, when this workspace reads as one of its holders. */

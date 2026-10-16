@@ -8,6 +8,7 @@ import {
   parseBlindingFile,
   RECORD_DISCLOSURE_MAX_BYTES_V1,
   RECORD_DISCLOSURE_SCHEMA_V1,
+  RECORD_DISCLOSURE_SCHEMA_V2,
   RECORD_HISTORY_BUNDLE_SCHEMA_V3,
   RECORD_LINK_COPY_MAX_BYTES_V1,
   RECORD_LINK_COPY_SCHEMA_V1,
@@ -58,11 +59,11 @@ export const USAGE = `Usage: pacspace-check <history.json> [options]
        pacspace-check <history.json> --key <path>
        pacspace-check open [--link-file <path>] [--access-code-file <path>] [--copy <path>] [--html <path>] [--source <url> | --rpc <url>] [--timeout <ms>] [--json]
        pacspace-check release [--origin <url>] [--source <url> | --rpc <url>] [--timeout <ms>] [--json]
-       pacspace-check release --origin <url> --release-record <record key>,<chain id>,<contract>
+       pacspace-check release --origin <url> --release-record <record key>,<network id>,<contract>
 
 Checks a PacSpace record history file: every entry against what was
 committed, the file against its own fingerprint, and the record against
-the public source. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace.
+the proof layer. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace.
 
 Options:
   --fingerprint <0x...>  the fingerprint printed on a statement; the checker
@@ -75,17 +76,17 @@ Options:
   --access-code-file <path>  open: read the access code from this file instead of asking
   --copy <path>          open: save a kept copy of what the link shows to a new file
   --html <path>          open: save the report as a page that opens without a network connection
-  --offline              check the file alone; do not read the public source
-  --source <url>         read the public source from this mirror instead of
+  --offline              check the file alone; do not read the proof layer
+  --source <url>         read the proof layer from this mirror instead of
                          the one known for the record's network
-  --rpc <url>            read the public source over JSON-RPC at this URL
-  --full                 also read the complete chain of daily statements
+  --rpc <url>            read the proof layer over JSON-RPC at this URL
+  --full                 also read every daily statement
   --timeout <ms>         network timeout per read (default 10000)
   --json                 print the report as JSON
   --version              print the checker's version
   --help                 print this text
 
-Exit codes: 0 the check passed as asked; 1 it did not, or the file you hold is not in it; 2 the history file, the link, a key, the file you hold, its blinding file or the arguments could not be used; 3 the public source or the link's host could not be reached. When more than one applies, 2 comes before 3, and 3 before 1.
+Exit codes: 0 the check passed as asked; 1 it did not, or the file you hold is not in it; 2 the history file, the link, a key, the file you hold, its blinding file or the arguments could not be used; 3 the proof layer or the link's host could not be reached. When more than one applies, 2 comes before 3, and 3 before 1.
 `;
 
 export const BLINDING_FILE_INVALID_SENTENCE = 'This is not a valid blinding file.';
@@ -280,7 +281,7 @@ async function readHistoryFile(io: CliIo, path: string): Promise<{ file: History
   }
   if (bytes.length > RECORD_LINK_COPY_MAX_BYTES_V1) throw new ExitTwo(TOO_LARGE_SENTENCE);
   const file = parseHistoryFile(new TextDecoder().decode(bytes));
-  if (file.schema === RECORD_DISCLOSURE_SCHEMA_V1 && bytes.length > RECORD_DISCLOSURE_MAX_BYTES_V1) {
+  if ((file.schema === RECORD_DISCLOSURE_SCHEMA_V1 || file.schema === RECORD_DISCLOSURE_SCHEMA_V2) && bytes.length > RECORD_DISCLOSURE_MAX_BYTES_V1) {
     throw new ExitTwo(TOO_LARGE_SENTENCE);
   }
   return { file, byteLength: bytes.length };
@@ -450,14 +451,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     const { file } = await readHistoryFile(io, args.file);
     let history: HistoryFile | undefined;
     if (args.history) {
-      if (file.schema !== RECORD_DISCLOSURE_SCHEMA_V1) throw new ExitTwo(`${HISTORY_ONLY_FOR_DISCLOSURE_SENTENCE}\n\n${USAGE}`.trimEnd());
+      if (file.schema !== RECORD_DISCLOSURE_SCHEMA_V1 && file.schema !== RECORD_DISCLOSURE_SCHEMA_V2) throw new ExitTwo(`${HISTORY_ONLY_FOR_DISCLOSURE_SENTENCE}\n\n${USAGE}`.trimEnd());
       history = (await readHistoryFile(io, args.history)).file;
       if (history.schema !== RECORD_SEAL_HISTORY_SCHEMA_V1 && history.schema !== RECORD_LINK_COPY_SCHEMA_V1) {
         throw new ExitTwo(NOT_A_HISTORY_SENTENCE);
       }
     }
     if (args.source === 'offline' && needsLedgerRoots(file)) throw new ExitTwo(DISCLOSURE_OFFLINE_SENTENCE);
-    if (file.schema === RECORD_DISCLOSURE_SCHEMA_V1 && !history) throw new ExitTwo(DISCLOSURE_NEEDS_HISTORY_SENTENCE);
+    if ((file.schema === RECORD_DISCLOSURE_SCHEMA_V1 || file.schema === RECORD_DISCLOSURE_SCHEMA_V2) && !history) throw new ExitTwo(DISCLOSURE_NEEDS_HISTORY_SENTENCE);
     if (args.key && file.schema !== RECORD_HISTORY_BUNDLE_SCHEMA_V3) throw new ExitTwo(KEY_ONLY_FOR_ENCRYPTED_SENTENCE);
     if (!args.key && file.schema === RECORD_HISTORY_BUNDLE_SCHEMA_V3) throw new ExitTwo(ENCRYPTED_NEEDS_KEY_SENTENCE);
     const recordKey = args.key ? await readRecordKey(io, args.key) : undefined;

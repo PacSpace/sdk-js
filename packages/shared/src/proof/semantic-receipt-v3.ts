@@ -148,7 +148,7 @@ export function recordContentOfReceipt(receipt: unknown): Record<string, unknown
     const c = r.recordContent;
     return c && typeof c === 'object' && !Array.isArray(c) ? (c as Record<string, unknown>) : null;
   }
-  if (r.schema === SEMANTIC_RECEIPT_SCHEMA_V3 && Array.isArray(r.revealed)) {
+  if ((r.schema === SEMANTIC_RECEIPT_SCHEMA_V3 || r.schema === 'semantic-receipt/v6') && Array.isArray(r.revealed)) {
     try {
       return recordContentFromLeavesV2(r.revealed.map((l: RevealedLeafV2) => ({ pointer: l?.pointer, value: l?.value })));
     } catch {

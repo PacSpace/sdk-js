@@ -21,14 +21,23 @@ export const RECORDS_ENCRYPTION_WORDS = {
   RECORDS_REKEY_STOPPED: 'Re-encryption stopped at entry {seq}. Entries after it are done; run it again to finish.',
   RECORDS_ROTATE_NOT_NEXT: 'The new workspace secret must add exactly the next version and keep every earlier one.',
   RECORDS_IDENTITY_OTHER: "This workspace already registered another identity, which this workspace secret doesn't open.",
+  RECORDS_OWNER_INVALID: "This workspace id isn't in the expected form.",
+  RECORDS_DISCLOSURE_LINK_MISMATCH: "This shared record doesn't match the link it came from.",
+  RECORDS_SECRET_FILE_OUTDATED: 'This workspace replaced its key. Use its new secret file on this server.',
+  RECORDS_RETIRED_KEY_MISMATCH: "A retired key for this workspace doesn't match its listed code. Don't use it; contact PacSpace.",
 } as const;
+
+/** RECORDS_VERSION_NOT_HELD's sentence when a write's claim names a version this client doesn't hold (card 10, W-C10-B-2). */
+export const RECORDS_WRITE_VERSION_NOT_HELD =
+  "This write was first made under encryption version {v}, which this client doesn't hold. Open that version first, or use a new reference.";
 
 export type RecordsEncryptionCode = keyof typeof RECORDS_ENCRYPTION_WORDS;
 
 /** A client-side refusal on an encrypted path: a code and its sentence, never a key. */
 export class RecordsEncryptionError extends PacSpaceError {
-  constructor(code: RecordsEncryptionCode, values: { v?: number | string; seq?: number | string } = {}) {
-    const sentence = RECORDS_ENCRYPTION_WORDS[code]
+  constructor(code: RecordsEncryptionCode, values: { v?: number | string; seq?: number | string; write?: boolean } = {}) {
+    const template = code === 'RECORDS_VERSION_NOT_HELD' && values.write ? RECORDS_WRITE_VERSION_NOT_HELD : RECORDS_ENCRYPTION_WORDS[code];
+    const sentence = template
       .replace('{v}', String(values.v ?? ''))
       .replace('{seq}', String(values.seq ?? ''));
     super(sentence, 0, code);

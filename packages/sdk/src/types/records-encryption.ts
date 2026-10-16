@@ -70,6 +70,8 @@ export interface RecordsShareKeyWrapInput extends RecordTarget {
   disclosureKey: Uint8Array | string;
   workspaceId: string;
   confirmedCode?: string;
+  /** The link's access code, when it has one: its disclosure is read to name it in the fragment. */
+  accessCode?: string;
 }
 
 export interface RecordCopyFile {
@@ -100,6 +102,8 @@ export interface RecordRotateResult {
   version: number;
   kid: string;
   holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }>;
+  /** Holders the new version has no wrap for yet: writes under it wait until each required one has one. */
+  holdersNeedingConfirmation: string[];
 }
 
 export interface RecordRekeyInput extends RecordTarget {

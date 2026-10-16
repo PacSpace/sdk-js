@@ -44,13 +44,25 @@ export function readSeedWrapShapeV1(wrap: unknown): { ok: true; kid: string; iv:
   return { ok: true, kid: w.kid, iv, ct };
 }
 
+type KeyWrapShape = { ok: true; to: string; enc: Uint8Array; ct: Uint8Array } | RecordsRefusalV1<'KEY_WRAP_MALFORMED' | 'KEY_WRAP_SUITE'>;
+
 /** The keyless checks every reader of a wrap to a holder runs first (N9). Never throws. */
-export function readKeyWrapShapeV1(
-  wrap: unknown,
-): { ok: true; to: string; enc: Uint8Array; ct: Uint8Array } | RecordsRefusalV1<'KEY_WRAP_MALFORMED' | 'KEY_WRAP_SUITE'> {
+export function readKeyWrapShapeV1(wrap: unknown): KeyWrapShape {
+  return readKeyWrapShape(wrap, 1);
+}
+
+/**
+ * The same checks for a wrap v2 (card 10, F3), the only form a store route
+ * takes and a reader opens: a v1 wrap is malformed here. Never throws.
+ */
+export function readKeyWrapShapeV2(wrap: unknown): KeyWrapShape {
+  return readKeyWrapShape(wrap, 2);
+}
+
+function readKeyWrapShape(wrap: unknown, v: 1 | 2): KeyWrapShape {
   if (!wrap || typeof wrap !== 'object' || Array.isArray(wrap)) return refuse('KEY_WRAP_MALFORMED');
   const w = wrap as Record<string, unknown>;
-  if (Object.keys(w).sort().join(',') !== 'ct,enc,suite,to,v' || w.v !== 1 || typeof w.suite !== 'string') return refuse('KEY_WRAP_MALFORMED');
+  if (Object.keys(w).sort().join(',') !== 'ct,enc,suite,to,v' || w.v !== v || typeof w.suite !== 'string') return refuse('KEY_WRAP_MALFORMED');
   if (w.suite !== KEY_WRAP_SUITE_V1) return refuse('KEY_WRAP_SUITE');
   if (typeof w.to !== 'string' || !HEX64.test(w.to)) return refuse('KEY_WRAP_MALFORMED');
   const enc = typeof w.enc === 'string' ? fromBase64Url(w.enc) : null;

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 - 2026-10-16
+
+### Changed
+
+- **Update the checker before checking encrypted records started after format 2. 0.4.0 and earlier can't check them: they refuse such a record's seal history as not well formed.**
+- Refuses the history of an encrypted record started before format 2: "This record uses an earlier encrypted format that this checker no longer accepts."
+- The checker's words say "the proof layer" where they said "the public source" (TERMINOLOGY v2.28): its sentences ("Compared with the proof layer for this record: it matches."), the report's Proof layer line, the usage text, the package description and this package's README. Two sentences that said "the ledger" say "the proof layer" too. The `--json` report's fields and the exit codes do not change.
+- The README says Node.js 20.19 or later, as `engines` does; it said 18.
+
+### Added
+
+- Reads record-disclosure/v2 and the histories of encrypted records started after format 2 (record hash v3).
+
 ## 0.4.0 - 2026-10-14
 
 ### Changed

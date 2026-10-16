@@ -1,7 +1,7 @@
 import { canonicalizeJcs } from '../proof/jcs';
 import { fromBase64Url, toBase64Url } from './base64url';
 import { concatBytes, platformCrypto, randomBytes, utf8 } from './platform-crypto';
-import { RECORD_DISCLOSURE_MAX_BYTES_V1, RecordDisclosureError, type RecordDisclosureV1 } from './record-disclosure-v1';
+import { RECORD_DISCLOSURE_MAX_BYTES_V1, RecordDisclosureError, type RecordDisclosure } from './record-disclosure-v1';
 
 /**
  * The sealed disclosure a link holds (ADR 0016; record-hash-v2.md section 7):
@@ -64,6 +64,34 @@ export function readDisclosureFragmentV1(hash: string): Uint8Array | null {
   return key && key.length === KEY_BYTES ? key : null;
 }
 
+/**
+ * A link's fragment in format 2 (card 10, D1 a): exactly one of `dk=` (the
+ * key, as before) or `dd=` (the disclosure's own digest, when the key comes
+ * from a wrap). Anything else, both, or a non-canonical text is null.
+ */
+export type DisclosureLinkFragmentV2 = { kind: 'key'; key: Uint8Array } | { kind: 'digest'; digest: string };
+
+const LINK_FRAGMENT_V2 = /^(dk|dd)=([A-Za-z0-9_-]{43})$/;
+const DIGEST_HEX = /^0x[0-9a-f]{64}$/;
+
+export function readDisclosureLinkFragmentV2(hash: string): DisclosureLinkFragmentV2 | null {
+  if (typeof hash !== 'string') return null;
+  const match = LINK_FRAGMENT_V2.exec(hash.startsWith('#') ? hash.slice(1) : hash);
+  if (!match) return null;
+  const bytes = fromBase64Url(match[2]);
+  if (!bytes || bytes.length !== KEY_BYTES || toBase64Url(bytes) !== match[2]) return null;
+  if (match[1] === 'dk') return { kind: 'key', key: bytes };
+  return { kind: 'digest', digest: `0x${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}` };
+}
+
+/** "dd=" plus the disclosure digest's 43 base64url characters, for after `#` in a link whose key comes from a wrap. */
+export function disclosureDigestFragmentV2(digest: string): string {
+  if (typeof digest !== 'string' || !DIGEST_HEX.test(digest)) throw new RecordDisclosureError('DISCLOSURE_MALFORMED');
+  const bytes = new Uint8Array(KEY_BYTES);
+  for (let i = 0; i < KEY_BYTES; i += 1) bytes[i] = parseInt(digest.slice(2 + i * 2, 4 + i * 2), 16);
+  return `dd=${toBase64Url(bytes)}`;
+}
+
 /** The keyless checks decryption runs first (size, encoding, version byte, padded length). Never throws. */
 export function readDisclosureEnvelopeShapeV1(
   text: string,
@@ -85,7 +113,7 @@ async function aesKey(key: Uint8Array, usage: 'encrypt' | 'decrypt'): Promise<Cr
 }
 
 /** The base64url envelope of a disclosure under a fresh IV. */
-export async function encryptDisclosureV1(input: { disclosure: RecordDisclosureV1; key: Uint8Array; handle: string }): Promise<string> {
+export async function encryptDisclosureV1(input: { disclosure: RecordDisclosure; key: Uint8Array; handle: string }): Promise<string> {
   const { key, handle } = input;
   if (!(key instanceof Uint8Array) || key.length !== KEY_BYTES || typeof handle !== 'string') {
     throw new RecordDisclosureError('DISCLOSURE_MALFORMED');

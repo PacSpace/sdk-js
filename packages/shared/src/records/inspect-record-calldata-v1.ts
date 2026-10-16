@@ -22,8 +22,17 @@ import {
 } from '../proof/slot-encoding-v1';
 import { SEMANTIC_RECEIPT_SCHEMA_V2, type SemanticReceiptV2 } from '../proof/semantic-receipt-v2';
 import { SEMANTIC_RECEIPT_SCHEMA_V3, type RecordReceipt, type SemanticReceiptV3 } from '../proof/semantic-receipt-v3';
+import { sealInputHash } from '../proof/seal-input';
 import { openRecordEntryV2 } from '../records-crypto/record-hash-v2';
-import { SEMANTIC_RECEIPT_SCHEMA_V4, type SemanticReceiptV4 } from './record-history-bundle-v3';
+import { openRecordEntryV3 } from '../records-crypto/record-hash-v3';
+import {
+  SEMANTIC_RECEIPT_SCHEMA_V4,
+  SEMANTIC_RECEIPT_SCHEMA_V5,
+  SEMANTIC_RECEIPT_SCHEMA_V6,
+  type SemanticReceiptV4,
+  type SemanticReceiptV5,
+  type SemanticReceiptV6,
+} from './record-history-bundle-v3';
 import { getPublishedLayoutRegistry } from './layouts';
 
 /** Public mirror nodes by chain id; never a PacSpace endpoint. */
@@ -181,12 +190,28 @@ export function collectRecordReceipts(doc: unknown): RecordReceipt[] {
   return [];
 }
 
-/** recomputeSealTagFromReceiptV2 for a receipt of either form; a v3 receipt's leaves are opened first. */
-export async function recomputeSealTagFromReceipt(receipt: RecordReceipt | SemanticReceiptV4): Promise<string> {
+/**
+ * recomputeSealTagFromReceiptV2 for a receipt of any form: a v3 or v6
+ * receipt's leaves or items are opened first; a v6 or v5 receipt is a record
+ * hash v3 entry, sealed over sealInputHash(3, hash).
+ */
+export async function recomputeSealTagFromReceipt(receipt: RecordReceipt | SemanticReceiptV4 | SemanticReceiptV5 | SemanticReceiptV6): Promise<string> {
   let recordHash: string;
-  if (receipt?.schema === SEMANTIC_RECEIPT_SCHEMA_V4) {
+  let sealedVersion: 1 | 2 | 3 = 2;
+  if (receipt?.schema === SEMANTIC_RECEIPT_SCHEMA_V4 || receipt?.schema === SEMANTIC_RECEIPT_SCHEMA_V5) {
     // Without the key the seal is recomputed from the stated record hash; the content is unchecked (formats note N7).
-    recordHash = (receipt as SemanticReceiptV4).recordHash;
+    recordHash = (receipt as SemanticReceiptV4 | SemanticReceiptV5).recordHash;
+    if (receipt.schema === SEMANTIC_RECEIPT_SCHEMA_V5) {
+      if ((receipt as SemanticReceiptV5).recordHashVersion !== 3) throw new Error('RECORD_HISTORY_RECEIPT_FORM');
+      sealedVersion = 3;
+    }
+  } else if (receipt?.schema === SEMANTIC_RECEIPT_SCHEMA_V6) {
+    const r = receipt as SemanticReceiptV6;
+    if (r.recordHashVersion !== 3) throw new Error('RECORD_HISTORY_RECEIPT_FORM');
+    const opened = await openRecordEntryV3(r, { every: true });
+    if (!opened.ok) throw new Error(opened.reason);
+    recordHash = opened.recordHash;
+    sealedVersion = 3;
   } else if (receipt?.schema === SEMANTIC_RECEIPT_SCHEMA_V3) {
     const opened = await openRecordEntryV2(receipt as SemanticReceiptV3, { every: true });
     if (!opened.ok) throw new Error(opened.reason);
@@ -199,7 +224,7 @@ export async function recomputeSealTagFromReceipt(receipt: RecordReceipt | Seman
     layoutVersion: Number(receipt.layoutVersion),
     layoutDigest: receipt.layoutDigest,
     state96: splitWordV1(String(receipt.newWord)).state96,
-    recordHash,
+    recordHash: sealInputHash(sealedVersion, recordHash),
     recordOpening: receipt.recordOpening,
   });
   return sealTagOfV1(seal).toLowerCase();

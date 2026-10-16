@@ -92,7 +92,7 @@ export interface CheckReport {
   heldFile?: { matched: boolean; entries: number[]; blinded: boolean };
   reason: string;
   sentences: string[];
-  /** 0 the check passed as asked; 1 it did not; 3 the public source could not be reached. */
+  /** 0 the check passed as asked; 1 it did not; 3 the proof layer could not be reached. */
   exitCode: 0 | 1 | 3;
 }
 
@@ -144,7 +144,7 @@ export const SEALS_BOUNDARY_SENTENCE =
 export const FIELDS_FAILED_SENTENCE = 'The revealed fields failed the check, so none are shown.';
 /** W-70 */
 export const ROOT_NOT_READ_SENTENCE =
-  'The revealed fields could not be checked against the ledger just now, so none are shown. Check again to try once more.';
+  'The revealed fields could not be checked against the proof layer just now, so none are shown. Check again to try once more.';
 /** W-71 */
 export const TOO_LARGE_SENTENCE = 'This file is too large to be a copy of this record.';
 /** W-C8 */
@@ -317,21 +317,21 @@ export function sealsVerdict(entries: number | null, v: SealsFacts, queued: numb
 export function sourceSentence(source: SourceOutcome): string {
   if (!source.compared) {
     return source.reason === 'offline'
-      ? 'Not compared with the public source. The check ran on this file alone.'
-      : 'The public source could not be reached. The check ran on this file alone.';
+      ? 'Not compared with the proof layer. The check ran on this file alone.'
+      : 'The proof layer could not be reached. The check ran on this file alone.';
   }
   return source.matches
-    ? 'Compared with the public source for this record: it matches.'
-    : `Compared with the public source for this record: it does not match.${source.detail ? ` ${source.detail}` : ''}`;
+    ? 'Compared with the proof layer for this record: it matches.'
+    : `Compared with the proof layer for this record: it does not match.${source.detail ? ` ${source.detail}` : ''}`;
 }
 
 export function dailyStatementSentence(statement: DailyStatementOutcome | null): string {
   if (!statement) return 'This file carries no daily statement.';
   const day = `Daily statement of ${dayOfUtc(statement.date)} (UTC)`;
   if (statement.matches === null) {
-    return `${day}: not compared from this file alone. Pass --full to compare it with the public source.`;
+    return `${day}: not compared from this file alone. Pass --full to compare it with the proof layer.`;
   }
-  return statement.matches ? `${day}: matches.` : `${day}: does not match what the public source carries for that day.`;
+  return statement.matches ? `${day}: matches.` : `${day}: does not match what the proof layer carries for that day.`;
 }
 
 export const FILE_CHANGED_SENTENCE =
@@ -511,7 +511,7 @@ export function renderReport(report: CheckReport): string {
     ['Fingerprint of this history', report.file.fingerprint ?? 'none'],
   ];
   if (report.file.exportedAt) facts.push(['Exported', `${report.file.exportedAt} (UTC)`]);
-  if (report.source.compared) facts.push(['Public source', report.source.readsFrom]);
+  if (report.source.compared) facts.push(['Proof layer', report.source.readsFrom]);
   const width = Math.max(...facts.map(([label]) => label.length));
   const lines = facts.map(([label, value]) => `${label.padEnd(width)}  ${value}`);
   lines.push('');

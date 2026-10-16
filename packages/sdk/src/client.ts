@@ -416,7 +416,7 @@ export class HttpClient {
     const headers: Record<string, string> = {
       'X-Api-Key': this.apiKey,
       'Content-Type': 'application/json',
-      'User-Agent': '@pacspace-io/sdk/0.13.0',
+      'User-Agent': '@pacspace-io/sdk/0.14.0',
     };
 
     if (options?.dashboardToken) {

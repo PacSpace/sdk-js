@@ -18,6 +18,7 @@ import {
   deriveItemOpeningV1,
 } from './hiding-commitment-v1';
 import { buildMerkleProofV2, computeMerkleItemsRootV2, normalizeProofHash } from './merkle-v2';
+import { sealInputHash, type SealedRecordHashVersion } from './seal-input';
 import { nextLedgerHeadV1 } from './ledger-head-v1';
 
 /**
@@ -380,7 +381,8 @@ export function planSlotRecordV1(input: BuildSlotRecordInputV1): PlannedSlotReco
 }
 
 /** The second half of buildSlotRecordV1: the opening, the seal, the word and the item hash, from a record hash. */
-export function sealSlotRecordV1(plan: PlannedSlotRecordV1, recordHash: string): BuiltSlotRecordV1 {
+/** Seals a planned record. The seal is over sealInputHash(sealedVersion, recordHash); the row keeps the raw hash. */
+export function sealSlotRecordV1(plan: PlannedSlotRecordV1, recordHash: string, sealedVersion: SealedRecordHashVersion = 1): BuiltSlotRecordV1 {
   const { doc, digest } = plan.layout;
   const { recordKey, seq, state96, previousWord } = plan;
   const content = plan.recordContent;
@@ -390,7 +392,7 @@ export function sealSlotRecordV1(plan: PlannedSlotRecordV1, recordHash: string):
     layoutVersion: doc.layoutVersion,
     layoutDigest: digest,
     state96,
-    recordHash,
+    recordHash: sealInputHash(sealedVersion, recordHash),
     recordOpening,
   });
   const newWord = composeWordV1(state96, seal);

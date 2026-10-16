@@ -1,6 +1,6 @@
 import { MLDSA65_PUBLIC_KEY_BYTES, MLDSA65_SIGNATURE_BYTES } from '../../records/signed-acknowledgment-v2';
-import { toBase64Url } from '../base64url';
-import { concatBytes, platformCrypto, randomBytes, sha256, utf8 } from '../platform-crypto';
+import { fromBase64Url, toBase64Url } from '../base64url';
+import { concatBytes, hmacSha256, platformCrypto, randomBytes, sha256, utf8 } from '../platform-crypto';
 import {
   RecordKeyV1,
   RecordsEncryptionError,
@@ -20,6 +20,7 @@ import {
   SEED_WRAP_CT_BYTES_V1,
   WORKSPACE_PUBLIC_KEY_BYTES_V1,
   readKeyWrapShapeV1,
+  readKeyWrapShapeV2,
   readSeedWrapShapeV1,
   workspacePublicKeyIdV1,
 } from '../wrap-shapes-v1';
@@ -31,6 +32,7 @@ export {
   SEED_WRAP_CT_BYTES_V1,
   WORKSPACE_PUBLIC_KEY_BYTES_V1,
   readKeyWrapShapeV1,
+  readKeyWrapShapeV2,
   readSeedWrapShapeV1,
 };
 
@@ -53,6 +55,8 @@ export const RECORDS_ASYMMETRIC_LABELS_V1 = {
   holderKeyCode: 'pacspace:holder-key-code:v1',
   seedWrap: 'pacspace:seed-wrap:v1',
   wrap: 'pacspace:wrap:v1',
+  wrapV2: 'pacspace:wrap:v2',
+  identityRotation: 'pacspace:identity-rotation:v1',
 } as const;
 
 /** The one wrap suite: HPKE base mode, MLKEM768-X25519 as draft-ietf-hpke-pq-05 fixes it, HKDF-SHA256, AES-256-GCM. */
@@ -77,7 +81,9 @@ export type RecordsAsymmetricCodeV1 =
   | 'KEY_WRAP_AUTH_FAILED'
   | 'KEY_WRAP_KEY_MISMATCH'
   | 'KEY_WRAP_BINDING_INVALID'
-  | 'MLDSA_KEY_INVALID';
+  | 'MLDSA_KEY_INVALID'
+  | 'ROTATION_BINDING_INVALID'
+  | 'ROTATION_CHALLENGE_MALFORMED';
 
 /** Thrown by the writing side only; its message is the code. */
 export class RecordsAsymmetricError extends Error {
@@ -391,13 +397,19 @@ export async function sealKeyWrapV1(input: {
   keyBytes: Uint8Array;
   ikmE?: Uint8Array;
 }): Promise<KeyWrapV1> {
+  const sealed = await sealUnder(input.publicKey, input.keyBytes, () => keyWrapInfoV1(input.binding), input.ikmE);
+  return { v: 1, ...sealed };
+}
+
+async function sealUnder(publicKey: Uint8Array, keyBytes: Uint8Array, infoOf: () => Promise<Uint8Array>, ikmE?: Uint8Array) {
+  const input = { publicKey, keyBytes, ikmE };
   assertPublicKey(input.publicKey);
   if (!(input.keyBytes instanceof Uint8Array) || input.keyBytes.length !== 32) throw new RecordsAsymmetricError('KEY_WRAP_BINDING_INVALID');
-  const info = await keyWrapInfoV1(input.binding);
+  const info = await infoOf();
   const suite = await wrapSuite(input.ikmE);
   const pk = await suite.DeserializePublicKey(Uint8Array.from(input.publicKey));
   const { encapsulatedSecret, ciphertext } = await suite.Seal(pk, Uint8Array.from(input.keyBytes), { info });
-  return { v: 1, suite: KEY_WRAP_SUITE_V1, to: await publicKeyIdV1(input.publicKey), enc: toBase64Url(encapsulatedSecret), ct: toBase64Url(ciphertext) };
+  return { suite: KEY_WRAP_SUITE_V1, to: await publicKeyIdV1(input.publicKey), enc: toBase64Url(encapsulatedSecret), ct: toBase64Url(ciphertext) };
 }
 
 /** `K_v`, wrapped to a workspace-scope holder's confirmed public key. */
@@ -428,13 +440,20 @@ export async function wrapDisclosureKeyV1(publicKey: Uint8Array, disclosureKey: 
 type UnwrapRefusal = RecordsRefusalV1<'KEY_WRAP_MALFORMED' | 'KEY_WRAP_SUITE' | 'KEY_WRAP_WRONG_HOLDER' | 'KEY_WRAP_AUTH_FAILED' | 'KEY_WRAP_BINDING_INVALID'>;
 
 async function openKeyWrap(seed: WorkspaceSeedV1, wrap: unknown, binding: KeyWrapBindingV1): Promise<{ ok: true; keyBytes: Uint8Array } | UnwrapRefusal> {
-  const shape = readKeyWrapShapeV1(wrap);
+  return openKeyWrapAs(seed, readKeyWrapShapeV1(wrap), () => keyWrapInfoV1(binding));
+}
+
+async function openKeyWrapAs(
+  seed: WorkspaceSeedV1,
+  shape: ReturnType<typeof readKeyWrapShapeV1>,
+  infoOf: () => Promise<Uint8Array>,
+): Promise<{ ok: true; keyBytes: Uint8Array } | UnwrapRefusal> {
   if (!shape.ok) return shape;
   if (!(seed instanceof WorkspaceSeedV1)) return refuse('KEY_WRAP_WRONG_HOLDER');
   if (shape.to !== seed.publicKeyId) return refuse('KEY_WRAP_WRONG_HOLDER');
   let info: Uint8Array;
   try {
-    info = await keyWrapInfoV1(binding);
+    info = await infoOf();
   } catch {
     return refuse('KEY_WRAP_BINDING_INVALID');
   }
@@ -501,6 +520,256 @@ export async function unwrapDisclosureKeyV1(input: {
   } catch {
     return refuse('KEY_WRAP_AUTH_FAILED');
   }
+}
+
+// ------------------------------------------------------------------ wraps v2 (card 10, F3)
+
+/**
+ * A wrap v2 binds who the key belongs to: the owner workspace's id, and for
+ * `K_v` its version, for a record's `RK` its own id. A wrap made for another
+ * owner, version or record key does not open. Only v2 is stored or opened.
+ */
+export interface KeyWrapV2 {
+  v: 2;
+  suite: typeof KEY_WRAP_SUITE_V1;
+  to: string;
+  enc: string;
+  ct: string;
+}
+
+export type KeyWrapBindingV2 =
+  | { purpose: 'records-key'; owner: string; version: number; recordsKeyId: string }
+  | { purpose: 'record-key'; owner: string; recordType: string; wireRecordId: string; recordKeyId: string }
+  | { purpose: 'disclosure-key'; owner: string; handle: string };
+
+/** A workspace id as PacSpace makes them (cuid): checked before it is hashed. */
+export const KEY_WRAP_OWNER_V2 = /^[a-z0-9]{20,32}$/;
+
+function bindingBytesV2(binding: KeyWrapBindingV2): Uint8Array {
+  if (typeof binding?.owner !== 'string' || !KEY_WRAP_OWNER_V2.test(binding.owner)) throw new RecordsAsymmetricError('KEY_WRAP_BINDING_INVALID');
+  const owner = utf8(binding.owner);
+  switch (binding.purpose) {
+    case 'records-key':
+      if (Number.isInteger(binding.version) && binding.version >= 1 && binding.version <= 0xffff && typeof binding.recordsKeyId === 'string' && HEX64.test(binding.recordsKeyId)) {
+        return concatBytes(owner, SEP, new Uint8Array([binding.version >> 8, binding.version & 0xff]), unhex(binding.recordsKeyId));
+      }
+      break;
+    case 'record-key':
+      if (
+        typeof binding.recordType === 'string' &&
+        PRINTABLE_ASCII.test(binding.recordType) &&
+        typeof binding.wireRecordId === 'string' &&
+        WIRE_ID.test(binding.wireRecordId) &&
+        typeof binding.recordKeyId === 'string' &&
+        HEX64.test(binding.recordKeyId)
+      ) {
+        return concatBytes(owner, SEP, utf8(binding.recordType), SEP, utf8(binding.wireRecordId), SEP, unhex(binding.recordKeyId));
+      }
+      break;
+    case 'disclosure-key':
+      if (typeof binding.handle === 'string' && PRINTABLE_ASCII.test(binding.handle)) return concatBytes(owner, SEP, utf8(binding.handle));
+      break;
+  }
+  throw new RecordsAsymmetricError('KEY_WRAP_BINDING_INVALID');
+}
+
+/** `"pacspace:wrap:v2" || 0x00 || purpose || 0x00 || SHA-256(binding)`, at most 64 bytes. */
+export async function keyWrapInfoV2(binding: KeyWrapBindingV2): Promise<Uint8Array> {
+  const bytes = bindingBytesV2(binding);
+  return concatBytes(utf8(L.wrapV2), SEP, utf8(binding.purpose), SEP, await sha256(bytes));
+}
+
+/** @internal Seals 32 key bytes to a public key as a wrap v2; `ikmE` fixes the encapsulation for vectors only. */
+export async function sealKeyWrapV2(input: { publicKey: Uint8Array; binding: KeyWrapBindingV2; keyBytes: Uint8Array; ikmE?: Uint8Array }): Promise<KeyWrapV2> {
+  const sealed = await sealUnder(input.publicKey, input.keyBytes, () => keyWrapInfoV2(input.binding), input.ikmE);
+  return { v: 2, ...sealed };
+}
+
+/** `K_v`, wrapped to a workspace-scope holder of `owner`'s records. */
+export async function wrapRecordsKeyV2(publicKey: Uint8Array, recordsKey: RecordsKeyV1, owner: string): Promise<KeyWrapV2> {
+  if (!(recordsKey instanceof RecordsKeyV1)) throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
+  return sealKeyWrapV2({
+    publicKey,
+    binding: { purpose: 'records-key', owner, version: recordsKey.version, recordsKeyId: recordsKey.id },
+    keyBytes: exportKeyBytesV1(recordsKey),
+  });
+}
+
+/** One of `owner`'s records' `RK`, wrapped to a record-scope holder or a counterparty. */
+export async function wrapRecordKeyV2(
+  publicKey: Uint8Array,
+  recordKey: RecordKeyV1,
+  record: { recordType: string; wireRecordId: string },
+  owner: string,
+): Promise<KeyWrapV2> {
+  if (!(recordKey instanceof RecordKeyV1)) throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
+  return sealKeyWrapV2({
+    publicKey,
+    binding: { purpose: 'record-key', owner, recordType: record?.recordType, wireRecordId: record?.wireRecordId, recordKeyId: recordKey.id },
+    keyBytes: exportKeyBytesV1(recordKey),
+  });
+}
+
+/** A disclosure key `owner` made, wrapped to a reader's confirmed public key. */
+export async function wrapDisclosureKeyV2(publicKey: Uint8Array, disclosureKey: Uint8Array, handle: string, owner: string): Promise<KeyWrapV2> {
+  return sealKeyWrapV2({ publicKey, binding: { purpose: 'disclosure-key', owner, handle }, keyBytes: disclosureKey });
+}
+
+const openKeyWrapV2 = (seed: WorkspaceSeedV1, wrap: unknown, binding: KeyWrapBindingV2) =>
+  openKeyWrapAs(seed, readKeyWrapShapeV2(wrap), () => keyWrapInfoV2(binding));
+
+/** `K_v` of `owner` from a wrap v2, its id recomputed from the bytes. Never throws. */
+export async function unwrapRecordsKeyV2(input: {
+  seed: WorkspaceSeedV1;
+  wrap: unknown;
+  owner: string;
+  version: number;
+  recordsKeyId: string;
+}): Promise<{ ok: true; recordsKey: RecordsKeyV1 } | UnwrapRefusal | RecordsRefusalV1<'KEY_WRAP_KEY_MISMATCH'>> {
+  try {
+    const opened = await openKeyWrapV2(input.seed, input.wrap, {
+      purpose: 'records-key',
+      owner: input?.owner,
+      version: input?.version,
+      recordsKeyId: input?.recordsKeyId,
+    });
+    if (!opened.ok) return opened;
+    const recordsKey = await recordsKeyFromBytesV1(opened.keyBytes, input.version);
+    if (recordsKey.id !== input.recordsKeyId) return refuse('KEY_WRAP_KEY_MISMATCH');
+    return { ok: true, recordsKey };
+  } catch {
+    return refuse('KEY_WRAP_AUTH_FAILED');
+  }
+}
+
+/**
+ * One of `owner`'s records' `RK` from a wrap v2. `recordKeyId` is the id the
+ * caller expects (the envelope it opens names it); the opened key's id must
+ * equal it. Never throws.
+ */
+export async function unwrapRecordKeyV2(input: {
+  seed: WorkspaceSeedV1;
+  wrap: unknown;
+  owner: string;
+  recordType: string;
+  wireRecordId: string;
+  recordKeyId: string;
+}): Promise<{ ok: true; recordKey: RecordKeyV1 } | UnwrapRefusal | RecordsRefusalV1<'KEY_WRAP_KEY_MISMATCH'>> {
+  try {
+    const opened = await openKeyWrapV2(input.seed, input.wrap, {
+      purpose: 'record-key',
+      owner: input?.owner,
+      recordType: input?.recordType,
+      wireRecordId: input?.wireRecordId,
+      recordKeyId: input?.recordKeyId,
+    });
+    if (!opened.ok) return opened;
+    const recordKey = await recordKeyFromBytesV1(opened.keyBytes);
+    if (recordKey.id !== input.recordKeyId) return refuse('KEY_WRAP_KEY_MISMATCH');
+    return { ok: true, recordKey };
+  } catch {
+    return refuse('KEY_WRAP_AUTH_FAILED');
+  }
+}
+
+/** A disclosure key `owner` made, from a wrap v2. Never throws. */
+export async function unwrapDisclosureKeyV2(input: {
+  seed: WorkspaceSeedV1;
+  wrap: unknown;
+  owner: string;
+  handle: string;
+}): Promise<{ ok: true; disclosureKey: Uint8Array } | UnwrapRefusal> {
+  try {
+    const opened = await openKeyWrapV2(input.seed, input.wrap, { purpose: 'disclosure-key', owner: input?.owner, handle: input?.handle });
+    if (!opened.ok) return opened;
+    return { ok: true, disclosureKey: opened.keyBytes };
+  } catch {
+    return refuse('KEY_WRAP_AUTH_FAILED');
+  }
+}
+
+// ------------------------------------------------------------------ identity rotation (card 10, F4)
+
+/**
+ * What a rotation proof binds: the workspace, the identity it leaves, the
+ * identity it moves to, and the one challenge it answers.
+ */
+export interface RotationBindingV1 {
+  workspaceId: string;
+  fromId: string;
+  newId: string;
+  challengeId: string;
+}
+
+/** A challenge id the API makes: 22 to 64 base64url characters. */
+export const ROTATION_CHALLENGE_ID_V1 = /^[A-Za-z0-9_-]{22,64}$/;
+/** The encapsulation sent with a challenge: 1,120 bytes. */
+export const ROTATION_CHALLENGE_ENC_BYTES_V1 = 1120;
+
+/** `"pacspace:identity-rotation:v1" || 0x00 || workspaceId || 0x00 || fromId || 0x00 || newId || 0x00 || challengeId`. */
+function rotationMessage(binding: RotationBindingV1): Uint8Array {
+  if (
+    typeof binding?.workspaceId !== 'string' ||
+    !KEY_WRAP_OWNER_V2.test(binding.workspaceId) ||
+    typeof binding.fromId !== 'string' ||
+    !HEX64.test(binding.fromId) ||
+    typeof binding.newId !== 'string' ||
+    !HEX64.test(binding.newId) ||
+    binding.fromId === binding.newId ||
+    typeof binding.challengeId !== 'string' ||
+    !ROTATION_CHALLENGE_ID_V1.test(binding.challengeId)
+  ) {
+    throw new RecordsAsymmetricError('ROTATION_BINDING_INVALID');
+  }
+  return concatBytes(
+    utf8(L.identityRotation), SEP, utf8(binding.workspaceId), SEP, utf8(binding.fromId), SEP, utf8(binding.newId), SEP, utf8(binding.challengeId),
+  );
+}
+
+const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+
+/** SHA-256 of a proof's bytes, 64 lowercase hex; null for a proof that is not 32 bytes of base64url. */
+export async function rotationProofHashV1(proof: unknown): Promise<string | null> {
+  if (typeof proof !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(proof)) return null;
+  const bytes = fromBase64Url(proof);
+  if (!bytes || bytes.length !== 32 || toBase64Url(bytes) !== proof) return null;
+  return hex(await sha256(bytes));
+}
+
+/**
+ * The API's side of a rotation challenge: an encapsulation to the current
+ * public key and the SHA-256 of the proof only the holder of the current
+ * seed can make. The shared secret never leaves this function. `ikmE` fixes
+ * the encapsulation for vectors only.
+ */
+export async function rotationChallengeV1(
+  currentPublicKey: Uint8Array,
+  binding: RotationBindingV1,
+  ikmE?: Uint8Array,
+): Promise<{ enc: string; proofHash: string }> {
+  assertPublicKey(currentPublicKey);
+  if ((await publicKeyIdV1(currentPublicKey)) !== binding?.fromId) throw new RecordsAsymmetricError('ROTATION_BINDING_INVALID');
+  const message = rotationMessage(binding);
+  const { hybrid } = await load();
+  const { cipherText, sharedSecret } = hybrid.ml_kem768_x25519.encapsulate(Uint8Array.from(currentPublicKey), ikmE);
+  const proof = await hmacSha256(sharedSecret, message);
+  sharedSecret.fill(0);
+  return { enc: toBase64Url(cipherText), proofHash: hex(await sha256(proof)) };
+}
+
+/** The current seed's answer to a challenge: base64url of HMAC-SHA256(shared secret, the binding). */
+export async function rotationProofV1(seed: WorkspaceSeedV1, enc: string, binding: RotationBindingV1): Promise<string> {
+  if (!(seed instanceof WorkspaceSeedV1) || binding?.fromId !== seed.publicKeyId) throw new RecordsAsymmetricError('ROTATION_BINDING_INVALID');
+  const message = rotationMessage(binding);
+  const cipherText = typeof enc === 'string' && /^[A-Za-z0-9_-]+$/.test(enc) ? fromBase64Url(enc) : null;
+  if (!cipherText || cipherText.length !== ROTATION_CHALLENGE_ENC_BYTES_V1 || toBase64Url(cipherText) !== enc) {
+    throw new RecordsAsymmetricError('ROTATION_CHALLENGE_MALFORMED');
+  }
+  const { hybrid } = await load();
+  const sharedSecret = hybrid.ml_kem768_x25519.decapsulate(cipherText, Uint8Array.from(heldBytes(seed, 'WORKSPACE_SEED_INVALID')));
+  const proof = await hmacSha256(sharedSecret, message);
+  sharedSecret.fill(0);
+  return toBase64Url(proof);
 }
 
 // ------------------------------------------------------------------ ML-DSA-65 (question C)

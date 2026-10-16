@@ -1,6 +1,7 @@
 import { verifyHiddenItemProofV1 } from '../proof/hiding-commitment-v1';
 import { canonicalizeJcs } from '../proof/jcs';
 import type { RecordReceipt } from '../proof/semantic-receipt-v3';
+import { sealInputHash } from '../proof/seal-input';
 import { computeRecordHashV1, computeSealV1, computeSlotItemHashV1, sealTagOfV1, splitWordV1 } from '../proof/slot-encoding-v1';
 import { concatBytes, isHex32, sha256, toHex0x, utf8 } from './platform-crypto';
 import {
@@ -11,6 +12,7 @@ import {
   type RecordLeafV2,
   type RevealedLeafV2,
 } from './record-hash-v2';
+import { openRecordEntryV3, parsePointerV3, validateRecordItemsV3, type RecordItemV3 } from './record-hash-v3';
 
 /**
  * record-disclosure/v1 (ADR 0016; record-hash-v2.md): chosen entries of one
@@ -18,8 +20,15 @@ import {
  * shown field against the entry's leaves, the leaves against the seal, and
  * the seal's item through its Merkle path to a batch root the reader read
  * from the chain itself. The verifier returns a result and never throws.
+ *
+ * record-disclosure/v2 (card 10, F1) is the same for a record hash v3
+ * record: each entry carries the v3 items, the seal is over
+ * sealInputHash(3, hash), and the digest has its own label. The form says
+ * which a record needs: a form marked `recordHashVersion: 3` takes only v2,
+ * and any other form only v1 (RECORD_HASH_VERSION_MISMATCH).
  */
 export const RECORD_DISCLOSURE_SCHEMA_V1 = 'record-disclosure/v1' as const;
+export const RECORD_DISCLOSURE_SCHEMA_V2 = 'record-disclosure/v2' as const;
 export const RECORD_DISCLOSURE_MAX_BYTES_V1 = 1048576;
 
 export type RecordDisclosureEntryV1 =
@@ -34,6 +43,35 @@ export interface RecordDisclosureV1 {
   recordHashVersion: 1 | 2;
   entries: RecordDisclosureEntryV1[];
   digest: string;
+}
+
+export interface RecordDisclosureEntryV2 {
+  seq: number;
+  recordOpening: string;
+  items: RecordItemV3[];
+  revealed: RevealedLeafV2[];
+}
+
+export interface RecordDisclosureV2 {
+  schema: typeof RECORD_DISCLOSURE_SCHEMA_V2;
+  recordKey: string;
+  chain: { chainId: number; contractAddress: string };
+  layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  recordHashVersion: 3;
+  entries: RecordDisclosureEntryV2[];
+  digest: string;
+}
+
+export type RecordDisclosure = RecordDisclosureV1 | RecordDisclosureV2;
+
+/** A receipt of a v3 record with its full copy: a served v6 receipt, or a v5 receipt opened in the holder's browser. */
+export interface RecordReceiptV3Items {
+  schema: 'semantic-receipt/v6';
+  recordKey: string;
+  seq: number;
+  recordOpening: string;
+  items: RecordItemV3[];
+  revealed: RevealedLeafV2[];
 }
 
 export interface SealHistoryEntryForDisclosureV1 {
@@ -51,6 +89,8 @@ export interface SealHistoryFormForDisclosureV1 {
   recordKey: string;
   chain: { chainId: number; contractAddress: string };
   layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  /** Present, and 3, only for a record hash v3 record. */
+  recordHashVersion?: 3;
   entries: SealHistoryEntryForDisclosureV1[];
 }
 
@@ -65,12 +105,13 @@ export type RecordDisclosureRefusalV1 =
   | 'DISCLOSURE_ENTRY_NOT_IN_HISTORY'
   | 'DISCLOSURE_LEAF_MISMATCH'
   | 'DISCLOSURE_SEAL_MISMATCH'
-  | 'DISCLOSURE_CHAIN_ROOT_MISSING';
+  | 'DISCLOSURE_CHAIN_ROOT_MISSING'
+  | 'RECORD_HASH_VERSION_MISMATCH';
 
 export type RecordDisclosureVerificationV1 =
   | {
       ok: true;
-      recordHashVersion: 1 | 2;
+      recordHashVersion: 1 | 2 | 3;
       entries: Array<{ seq: number; batchId: number; fields: RecordLeafV2[]; withheld: number; content: Record<string, unknown> | null }>;
     }
   | { ok: false; code: RecordDisclosureRefusalV1; seq: number | null; reason: string };
@@ -85,6 +126,7 @@ const REASONS = {
   DISCLOSURE_SEAL_MISMATCH: (n: number) => `Entry ${n} of this disclosure does not reproduce the seal recorded on the ledger for it.`,
   DISCLOSURE_CHAIN_ROOT_MISSING: (n: number) =>
     `Entry ${n} could not be checked: the ledger's record of its batch was not available. Try again.`,
+  RECORD_HASH_VERSION_MISMATCH: () => "This shared record's format doesn't match the record on the ledger.",
 } as const;
 const RECORD_HASH_MISMATCH = (n: number) => `Entry ${n} of this disclosure does not match the record hash in the record's sealed history.`;
 
@@ -97,6 +139,7 @@ export class RecordDisclosureError extends Error {
 }
 
 const DIGEST_LABEL = 'pacspace:record-disclosure-digest:v1';
+const DIGEST_LABEL_V2 = 'pacspace:record-disclosure-digest:v2';
 const ADDRESS = /^0x[0-9a-f]{40}$/;
 const ZERO32 = '0x' + '0'.repeat(64);
 const UINT32_MAX = 4294967295;
@@ -120,11 +163,25 @@ const hasExactly = (v: Record<string, unknown>, keys: readonly string[]) => {
 const isUint32 = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0 && (v as number) <= UINT32_MAX;
 const isSafeNatural = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 
-/** SHA-256("pacspace:record-disclosure-digest:v1" || 0x00 || utf8(JCS(disclosure without "digest"))). */
-export async function computeRecordDisclosureDigestV1(disclosure: Omit<RecordDisclosureV1, 'digest'> & { digest?: string }): Promise<string> {
+async function digestUnder(label: string, disclosure: object): Promise<string> {
   const rest: Record<string, unknown> = { ...disclosure };
   delete rest.digest;
-  return toHex0x(await sha256(concatBytes(utf8(DIGEST_LABEL), new Uint8Array([0]), utf8(canonicalizeJcs(rest)))));
+  return toHex0x(await sha256(concatBytes(utf8(label), new Uint8Array([0]), utf8(canonicalizeJcs(rest)))));
+}
+
+/** SHA-256("pacspace:record-disclosure-digest:v1" || 0x00 || utf8(JCS(disclosure without "digest"))). */
+export async function computeRecordDisclosureDigestV1(disclosure: Omit<RecordDisclosureV1, 'digest'> & { digest?: string }): Promise<string> {
+  return digestUnder(DIGEST_LABEL, disclosure);
+}
+
+/** SHA-256("pacspace:record-disclosure-digest:v2" || 0x00 || utf8(JCS(disclosure without "digest"))). */
+export async function computeRecordDisclosureDigestV2(disclosure: Omit<RecordDisclosureV2, 'digest'> & { digest?: string }): Promise<string> {
+  return digestUnder(DIGEST_LABEL_V2, disclosure);
+}
+
+/** A disclosure's digest under its own schema's label. */
+export function computeRecordDisclosureDigest(disclosure: Omit<RecordDisclosure, 'digest'> & { digest?: string }): Promise<string> {
+  return disclosure.schema === RECORD_DISCLOSURE_SCHEMA_V2 ? digestUnder(DIGEST_LABEL_V2, disclosure) : digestUnder(DIGEST_LABEL, disclosure);
 }
 
 function chainShapeOk(chain: unknown, exact: boolean): chain is { chainId: number; contractAddress: string } {
@@ -147,20 +204,27 @@ function layoutShapeOk(layout: unknown, exact: boolean): layout is { layoutId: n
   );
 }
 
-function revealedShapeOk(revealed: unknown, leafCount: number): boolean {
+function revealedShapeOk(revealed: unknown, leafCount: number, parsePointer: (p: string) => unknown = parsePointerV2): boolean {
   if (!Array.isArray(revealed) || revealed.length > leafCount) return false;
   for (let i = 0; i < revealed.length; i += 1) {
     const leaf = revealed[i];
     if (!isPlainObject(leaf) || !hasExactly(leaf, ['pointer', 'value', 'salt'])) return false;
-    if (typeof leaf.pointer !== 'string' || !parsePointerV2(leaf.pointer) || !isHex32(leaf.salt)) return false;
+    if (typeof leaf.pointer !== 'string' || !parsePointer(leaf.pointer) || !isHex32(leaf.salt)) return false;
     if (hasLoneSurrogate(leaf.value)) return false;
     if (i > 0 && !((revealed[i - 1] as RevealedLeafV2).pointer < leaf.pointer)) return false;
   }
   return true;
 }
 
-function entryShapeOk(entry: unknown, version: 1 | 2): boolean {
+function entryShapeOk(entry: unknown, version: 1 | 2 | 3): boolean {
   if (!isPlainObject(entry) || !isUint32(entry.seq) || !isHex32(entry.recordOpening)) return false;
+  if (version === 3) {
+    return (
+      hasExactly(entry, ['seq', 'recordOpening', 'items', 'revealed']) &&
+      validateRecordItemsV3(entry.items) &&
+      revealedShapeOk(entry.revealed, (entry.items as RecordItemV3[]).length, parsePointerV3)
+    );
+  }
   if (version === 1) {
     return hasExactly(entry, ['seq', 'recordOpening', 'recordContent']) && isPlainObject(entry.recordContent) && !hasLoneSurrogate(entry.recordContent);
   }
@@ -173,15 +237,15 @@ function entryShapeOk(entry: unknown, version: 1 | 2): boolean {
   return revealedShapeOk(entry.revealed, leaves.length);
 }
 
-function disclosureShapeOk(d: Record<string, unknown>): d is Record<string, unknown> & RecordDisclosureV1 {
+function disclosureShapeOk(d: Record<string, unknown>): d is Record<string, unknown> & RecordDisclosure {
   if (!hasExactly(d, ['schema', 'recordKey', 'chain', 'layout', 'recordHashVersion', 'entries', 'digest'])) return false;
   if (!isHex32(d.recordKey) || !isHex32(d.digest)) return false;
   if (!chainShapeOk(d.chain, true) || !layoutShapeOk(d.layout, true)) return false;
-  if (d.recordHashVersion !== 1 && d.recordHashVersion !== 2) return false;
+  if (d.schema === RECORD_DISCLOSURE_SCHEMA_V2 ? d.recordHashVersion !== 3 : d.recordHashVersion !== 1 && d.recordHashVersion !== 2) return false;
   const entries = d.entries;
   if (!Array.isArray(entries) || entries.length === 0) return false;
   for (let i = 0; i < entries.length; i += 1) {
-    if (!entryShapeOk(entries[i], d.recordHashVersion)) return false;
+    if (!entryShapeOk(entries[i], d.recordHashVersion as 1 | 2 | 3)) return false;
     if (i > 0 && !(entries[i - 1].seq < entries[i].seq)) return false;
   }
   return true;
@@ -189,6 +253,7 @@ function disclosureShapeOk(d: Record<string, unknown>): d is Record<string, unkn
 
 function formShapeOk(form: unknown): form is SealHistoryFormForDisclosureV1 {
   if (!isPlainObject(form) || !isHex32(form.recordKey)) return false;
+  if (form.recordHashVersion !== undefined && form.recordHashVersion !== 3) return false;
   if (!chainShapeOk(form.chain, false) || !layoutShapeOk(form.layout, false)) return false;
   const entries = form.entries;
   if (!Array.isArray(entries)) return false;
@@ -227,7 +292,9 @@ async function verifyDisclosure(input: {
   disclosure: unknown;
 }): Promise<RecordDisclosureVerificationV1> {
   const d = input?.disclosure;
-  if (!isPlainObject(d) || d.schema !== RECORD_DISCLOSURE_SCHEMA_V1) return refuse('DISCLOSURE_MALFORMED', null);
+  if (!isPlainObject(d) || (d.schema !== RECORD_DISCLOSURE_SCHEMA_V1 && d.schema !== RECORD_DISCLOSURE_SCHEMA_V2)) {
+    return refuse('DISCLOSURE_MALFORMED', null);
+  }
 
   let canonical: string;
   try {
@@ -240,7 +307,7 @@ async function verifyDisclosure(input: {
   const form = input.form;
   if (!disclosureShapeOk(d) || !formShapeOk(form)) return refuse('DISCLOSURE_MALFORMED', null);
 
-  if ((await computeRecordDisclosureDigestV1(d)) !== d.digest) return refuse('DISCLOSURE_DIGEST_MISMATCH', null);
+  if ((await computeRecordDisclosureDigest(d)) !== d.digest) return refuse('DISCLOSURE_DIGEST_MISMATCH', null);
 
   if (
     d.recordKey !== form.recordKey ||
@@ -252,6 +319,10 @@ async function verifyDisclosure(input: {
   ) {
     return refuse('DISCLOSURE_RECORD_MISMATCH', null);
   }
+  if ((form.recordHashVersion === 3) !== (d.schema === RECORD_DISCLOSURE_SCHEMA_V2)) {
+    return refuse('RECORD_HASH_VERSION_MISMATCH', null);
+  }
+  const sealedVersion = d.recordHashVersion;
 
   const bySeq = new Map(form.entries.map((e) => [e.seq, e] as const));
   const roots: Record<string, unknown> = isPlainObject(input.chainRoots) ? input.chainRoots : {};
@@ -265,7 +336,11 @@ async function verifyDisclosure(input: {
     let fields: RecordLeafV2[];
     let withheld: number;
     let content: Record<string, unknown> | null;
-    if ('leaves' in entry) {
+    if ('items' in entry) {
+      const opened = await openRecordEntryV3(entry, { every: false });
+      if (!opened.ok) return refuse(opened.failure === 'leaf-mismatch' ? 'DISCLOSURE_LEAF_MISMATCH' : 'DISCLOSURE_MALFORMED', seq);
+      ({ recordHash, fields, withheld, content } = opened);
+    } else if ('leaves' in entry) {
       const opened = await openRecordEntryV2(entry, { every: false });
       if (!opened.ok) return refuse(opened.failure === 'leaf-mismatch' ? 'DISCLOSURE_LEAF_MISMATCH' : 'DISCLOSURE_MALFORMED', seq);
       ({ recordHash, fields, withheld, content } = opened);
@@ -291,7 +366,7 @@ async function verifyDisclosure(input: {
       layoutVersion: d.layout.layoutVersion,
       layoutDigest: d.layout.layoutDigest,
       state96: split.state96,
-      recordHash,
+      recordHash: sealInputHash(sealedVersion, recordHash),
       recordOpening: entry.recordOpening,
     });
     if (sealTagOfV1(seal) !== split.sealTag) return refuse('DISCLOSURE_SEAL_MISMATCH', seq);
@@ -324,23 +399,55 @@ async function verifyDisclosure(input: {
   return { ok: true, recordHashVersion: d.recordHashVersion, entries: out };
 }
 
+/** The leaves of a full copy that a disclosure shows: all of them, or the listed pointers, each of which must be there. */
+function chosenLeaves(revealed: readonly RevealedLeafV2[], reveal: 'all' | string[]): RevealedLeafV2[] | null {
+  const copy = (l: RevealedLeafV2) => ({ pointer: l.pointer, value: l.value, salt: l.salt });
+  if (reveal === 'all') return revealed.map(copy);
+  if (!Array.isArray(reveal) || new Set(reveal).size !== reveal.length) return null;
+  const known = new Set(revealed.map((l) => l.pointer));
+  if (reveal.some((p) => !known.has(p))) return null;
+  const wanted = new Set(reveal);
+  return revealed.filter((l) => wanted.has(l.pointer)).map(copy);
+}
+
 /**
  * Builds a disclosure from receipts the caller holds (a tenant's receipts or
  * a served bundle's). A semantic-receipt/v3 entry shows the listed fields; a
- * semantic-receipt/v2 entry is shown whole. It never needs a salt key.
+ * semantic-receipt/v2 entry is shown whole. Receipts of a v3 record (v6, or
+ * a v5 opened into v6's shape) build a record-disclosure/v2. It never needs
+ * a salt key.
  */
 export async function buildRecordDisclosureV1(input: {
   recordKey: string;
   chain: { chainId: number; contractAddress: string };
   layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
   entries: Array<{ receipt: RecordReceipt; reveal: 'all' | string[] }>;
-}): Promise<RecordDisclosureV1> {
+}): Promise<RecordDisclosureV1>;
+export async function buildRecordDisclosureV1(input: {
+  recordKey: string;
+  chain: { chainId: number; contractAddress: string };
+  layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  entries: Array<{ receipt: RecordReceiptV3Items; reveal: 'all' | string[] }>;
+}): Promise<RecordDisclosureV2>;
+export async function buildRecordDisclosureV1(input: {
+  recordKey: string;
+  chain: { chainId: number; contractAddress: string };
+  layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  entries: Array<{ receipt: RecordReceipt | RecordReceiptV3Items; reveal: 'all' | string[] }>;
+}): Promise<RecordDisclosure>;
+export async function buildRecordDisclosureV1(input: {
+  recordKey: string;
+  chain: { chainId: number; contractAddress: string };
+  layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  entries: Array<{ receipt: RecordReceipt | RecordReceiptV3Items; reveal: 'all' | string[] }>;
+}): Promise<RecordDisclosure> {
   const malformed = () => new RecordDisclosureError('DISCLOSURE_MALFORMED');
   if (!input || !Array.isArray(input.entries) || input.entries.length === 0) throw malformed();
   const recordKey = String(input.recordKey).toLowerCase();
   const schemas = new Set(input.entries.map((e) => e?.receipt?.schema));
   if (schemas.size !== 1) throw malformed();
   const schema = [...schemas][0];
+  if (schema === 'semantic-receipt/v6') return buildDisclosureV2(input as Parameters<typeof buildDisclosureV2>[0]);
   if (schema !== 'semantic-receipt/v2' && schema !== 'semantic-receipt/v3') throw malformed();
   const version: 1 | 2 = schema === 'semantic-receipt/v3' ? 2 : 1;
 
@@ -354,16 +461,9 @@ export async function buildRecordDisclosureV1(input: {
       entries.push({ seq: receipt.seq, recordOpening: receipt.recordOpening, recordContent: receipt.recordContent });
       continue;
     }
-    let revealed: RevealedLeafV2[];
-    if (reveal === 'all') {
-      revealed = receipt.revealed.map((l) => ({ pointer: l.pointer, value: l.value, salt: l.salt }));
-    } else {
-      if (!Array.isArray(reveal) || new Set(reveal).size !== reveal.length) throw malformed();
-      const wanted = new Set(reveal);
-      const known = new Set(receipt.revealed.map((l) => l.pointer));
-      if (reveal.some((p) => !known.has(p))) throw malformed();
-      revealed = receipt.revealed.filter((l) => wanted.has(l.pointer)).map((l) => ({ pointer: l.pointer, value: l.value, salt: l.salt }));
-    }
+    if (receipt.schema !== 'semantic-receipt/v3') throw malformed();
+    const revealed = chosenLeaves(receipt.revealed, reveal);
+    if (!revealed) throw malformed();
     entries.push({ seq: receipt.seq, recordOpening: receipt.recordOpening, leaves: [...receipt.leaves], revealed });
   }
   entries.sort((a, b) => a.seq - b.seq);
@@ -377,6 +477,40 @@ export async function buildRecordDisclosureV1(input: {
     entries,
   };
   const disclosure: RecordDisclosureV1 = { ...body, digest: await computeRecordDisclosureDigestV1(body) };
+  if (utf8(canonicalizeJcs(disclosure)).length > RECORD_DISCLOSURE_MAX_BYTES_V1) {
+    throw new RecordDisclosureError('DISCLOSURE_TOO_LARGE');
+  }
+  return disclosure;
+}
+
+async function buildDisclosureV2(input: {
+  recordKey: string;
+  chain: { chainId: number; contractAddress: string };
+  layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  entries: Array<{ receipt: RecordReceiptV3Items; reveal: 'all' | string[] }>;
+}): Promise<RecordDisclosureV2> {
+  const malformed = () => new RecordDisclosureError('DISCLOSURE_MALFORMED');
+  const recordKey = String(input.recordKey).toLowerCase();
+  const seen = new Set<number>();
+  const entries: RecordDisclosureEntryV2[] = [];
+  for (const { receipt, reveal } of input.entries) {
+    if (String(receipt.recordKey).toLowerCase() !== recordKey || seen.has(receipt.seq)) throw malformed();
+    if (!validateRecordItemsV3(receipt.items) || !Array.isArray(receipt.revealed)) throw malformed();
+    seen.add(receipt.seq);
+    const revealed = chosenLeaves(receipt.revealed, reveal);
+    if (!revealed) throw malformed();
+    entries.push({ seq: receipt.seq, recordOpening: receipt.recordOpening, items: receipt.items.map((it) => [it[0], it[1], it[2]]), revealed });
+  }
+  entries.sort((a, b) => a.seq - b.seq);
+  const body: Omit<RecordDisclosureV2, 'digest'> = {
+    schema: RECORD_DISCLOSURE_SCHEMA_V2,
+    recordKey,
+    chain: { chainId: input.chain.chainId, contractAddress: String(input.chain.contractAddress).toLowerCase() },
+    layout: { layoutId: input.layout.layoutId, layoutVersion: input.layout.layoutVersion, layoutDigest: input.layout.layoutDigest },
+    recordHashVersion: 3,
+    entries,
+  };
+  const disclosure: RecordDisclosureV2 = { ...body, digest: await computeRecordDisclosureDigestV2(body) };
   if (utf8(canonicalizeJcs(disclosure)).length > RECORD_DISCLOSURE_MAX_BYTES_V1) {
     throw new RecordDisclosureError('DISCLOSURE_TOO_LARGE');
   }

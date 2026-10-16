@@ -5,6 +5,7 @@ import {
   blindedDigest,
   buildRecordDisclosureV1,
   buildRecordLinkCopyV1,
+  computeRecordDisclosureDigest,
   createMirrorNodeRecordChainReader,
   createRpcRecordChainReader,
   disclosureFormOfV1,
@@ -18,7 +19,9 @@ import {
   verifyRecordHistoryBundle,
   verifyRecordSealHistoryV1,
   decryptDisclosureV1,
+  disclosureDigestFragmentV2,
   readDisclosureFragmentV1,
+  readDisclosureLinkFragmentV2,
   RECORD_HISTORY_BUNDLE_SCHEMA_V3,
   type HeldFile,
   type RecordChainReader,
@@ -392,7 +395,8 @@ export class RecordsResource {
       return this.client.get<RecordReceiptResponse>(path, input.grant ? this.encrypted.requestOptions({ grant: input.grant }, options) : options);
     }
     const response = await this.client.get<RecordReceiptResponse>(path, this.encrypted.requestOptions(input, options));
-    if ((response.receipt as { schema?: unknown })?.schema !== 'semantic-receipt/v4') return response;
+    const schema = (response.receipt as { schema?: unknown })?.schema;
+    if (schema !== 'semantic-receipt/v4' && schema !== 'semantic-receipt/v5') return response;
     if (response.recordType !== recordType || response.entityId !== target.entityId) throw new RecordsEncryptionError('RECORDS_HISTORY_OTHER_RECORD');
     const opened = await this.encrypted.openReceipt(response.receipt, { recordType, wireRecordId: target.entityId }, input, options);
     return { ...response, opened };
@@ -468,16 +472,47 @@ export class RecordsResource {
 
   /**
    * Stores a disclosure link's key wrapped to a reader workspace whose code
-   * you confirmed, so it opens the link without the part after #.
+   * you confirmed, so it opens the link without the key after #. Give them
+   * the link with `#` and the returned `fragment` (`dd=`, the disclosure's
+   * digest): their client opens only the disclosure that digest names.
    */
-  async shareKeyWrap(input: RecordsShareKeyWrapInput, options?: RequestOptions): Promise<Record<string, unknown>> {
+  async shareKeyWrap(input: RecordsShareKeyWrapInput, options?: RequestOptions): Promise<Record<string, unknown> & { fragment: string }> {
     const recordType = input.recordType || DEFAULT_RECORD_TYPE;
     const t = await this.targetOf(input);
     const key = disclosureKeyOf(input.disclosureKey);
     if (!key) throw new RecordsEncryptionError('RECORDS_LINK_NO_KEY');
     const handle = normalizedHandle(input.handle);
+    const { envelope } = await this.linkDisclosure(handle, input.accessCode);
+    const opened = typeof envelope === 'string' ? await decryptDisclosureV1({ envelope, key, handle }) : null;
+    if (!opened?.ok) throw new RecordsEncryptionError('RECORDS_DISCLOSURE_LINK_MISMATCH');
+    const digest = await computeRecordDisclosureDigest(opened.disclosure as RecordDisclosureV1);
+    if (digest !== (opened.disclosure as RecordDisclosureV1).digest) throw new RecordsEncryptionError('RECORDS_DISCLOSURE_LINK_MISMATCH');
+    const fragment = disclosureDigestFragmentV2(digest);
     const body = await this.encrypted.disclosureWrap(handle, key, input.workspaceId, input.confirmedCode);
-    return this.client.put(recordPath(recordType, t.entityId, `/share/${encodeURIComponent(handle)}/key-wraps`), body, options);
+    const stored = await this.client.put<Record<string, unknown>>(recordPath(recordType, t.entityId, `/share/${encodeURIComponent(handle)}/key-wraps`), body, options);
+    return { ...stored, fragment };
+  }
+
+  /** A link's seal history and sealed disclosure, read as anyone with the link reads them. */
+  private async linkDisclosure(handle: string, accessCode?: string): Promise<{ form: RecordSealHistoryV1; envelope: unknown }> {
+    const path = (tail: string) => `/api/v1/c/${encodeURIComponent(handle)}${tail}`;
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (accessCode) {
+      const verified = await this.client.fetchPublic(path('/access/verify'), {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ factor: 'ACCESS_HINT', value: accessCode }),
+      });
+      if (!verified.ok) throw await linkRefusal(verified, path('/access/verify'));
+      const cookie = (verified.headers.get('set-cookie') ?? '').split(';')[0];
+      if (cookie) headers.Cookie = cookie;
+    }
+    const seals = await this.client.fetchPublic(path('/history'), { method: 'GET', headers: { ...headers, 'X-Record-Entries': 'all' } });
+    if (!seals.ok) throw await linkRefusal(seals, path('/history'));
+    const form = (await seals.json()) as RecordSealHistoryV1;
+    const answer = await this.client.fetchPublic(path('/disclosure'), { method: 'GET', headers });
+    const envelope = answer.ok ? ((await answer.json()) as { envelope?: unknown })?.envelope : undefined;
+    return { form, envelope };
   }
 
   /**
@@ -491,30 +526,17 @@ export class RecordsResource {
     const match = /\/c\/([^/]+)\/?$/.exec(url.pathname);
     if (!match) throw new RecordDisclosureError('DISCLOSURE_MALFORMED');
     const handle = normalizedHandle(match[1]);
-    const path = (tail: string) => `/api/v1/c/${encodeURIComponent(handle)}${tail}`;
-    const headers: Record<string, string> = { Accept: 'application/json' };
-    if (input.accessCode) {
-      const verified = await this.client.fetchPublic(path('/access/verify'), {
-        method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ factor: 'ACCESS_HINT', value: input.accessCode }),
-      });
-      if (!verified.ok) throw await linkRefusal(verified, path('/access/verify'));
-      const cookie = (verified.headers.get('set-cookie') ?? '').split(';')[0];
-      if (cookie) headers.Cookie = cookie;
-    }
-    const seals = await this.client.fetchPublic(path('/history'), { method: 'GET', headers: { ...headers, 'X-Record-Entries': 'all' } });
-    if (!seals.ok) throw await linkRefusal(seals, path('/history'));
-    const form = (await seals.json()) as RecordSealHistoryV1;
+    const { form, envelope } = await this.linkDisclosure(handle, input.accessCode);
     if (!verifyRecordSealHistoryV1(form, { layouts: getPublishedLayoutRegistry() }).verified) {
       throw new RecordDisclosureError('DISCLOSURE_MALFORMED');
     }
-    const answer = await this.client.fetchPublic(path('/disclosure'), { method: 'GET', headers });
-    const envelope = answer.ok ? ((await answer.json()) as { envelope?: unknown })?.envelope : undefined;
     if (typeof envelope !== 'string') return { handle, sealHistory: form as unknown as Record<string, unknown>, disclosure: null, entries: [] };
 
-    const key = readDisclosureFragmentV1(url.hash) ?? (await this.encrypted.disclosureKeyFromWrap(handle));
+    // Card 10, D1 a: a key from a wrap opens only the disclosure the link's dd= names.
+    const fragment = readDisclosureLinkFragmentV2(url.hash);
+    const key = fragment?.kind === 'key' ? fragment.key : await this.encrypted.disclosureKeyFromWrap(handle);
     if (!key) throw new RecordsEncryptionError('RECORDS_LINK_NO_KEY');
+    const expectedDigest = fragment?.kind === 'key' ? null : fragment?.kind === 'digest' ? fragment.digest : '';
     const opened = await decryptDisclosureV1({ envelope, key, handle });
     if (!opened.ok) throw new PacSpaceError(opened.reason, 0, opened.code);
     const disclosure = opened.disclosure as RecordDisclosureV1;
@@ -526,6 +548,7 @@ export class RecordsResource {
     );
     const checked = await verifyRecordDisclosureV1({ form: disclosureForm, chainRoots, disclosure });
     if (!checked.ok) throw new PacSpaceError(checked.reason, 0, checked.code);
+    if (expectedDigest !== null && disclosure.digest !== expectedDigest) throw new RecordsEncryptionError('RECORDS_DISCLOSURE_LINK_MISMATCH');
     return {
       handle,
       sealHistory: form as unknown as Record<string, unknown>,

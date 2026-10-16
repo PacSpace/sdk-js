@@ -3,7 +3,15 @@
  * SDK uses, with no Node module on its path. A key page passes its own
  * transport, keys and pin store; nothing here is a second client.
  */
-export { EncryptedRecords, RECORDS_GRANT_HEADER, RECORDS_HOLDER_HEADER, RECORDS_SUPPORT_HEADER, recordPathOf } from './encrypted-records';
+export {
+  EncryptedRecords,
+  RECORDS_GRANT_HEADER,
+  RECORDS_HOLDER_HEADER,
+  RECORDS_STEP_UP_HEADER,
+  RECORDS_SUPPORT_HEADER,
+  recordPathOf,
+  type KeyChange,
+} from './encrypted-records';
 export { RecordsKeys, keyringOf, type Keyring } from './keys';
 export { loadRecordsCrypto, type RecordsCrypto } from './loader';
 export { memoryPinStore, type RecordsPin, type RecordsPinStore } from './pin-store';

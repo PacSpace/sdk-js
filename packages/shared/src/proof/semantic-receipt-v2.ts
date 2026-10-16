@@ -2,6 +2,7 @@ import { verifyHiddenItemProofV1 } from './hiding-commitment-v1';
 import { DecodedState, decodeStateV1 } from './layout-document-v1';
 import { LedgerBatchRef, verifyLedgerChainV1 } from './ledger-head-v1';
 import { normalizeProofHash } from './merkle-v2';
+import { sealInputHash, type SealedRecordHashVersion } from './seal-input';
 import {
   LayoutRegistry,
   SLOT_ENCODING_VERSION_V1,
@@ -129,7 +130,13 @@ export type SlotReceiptCoreV1 = Omit<SemanticReceiptV2, 'schema' | 'recordConten
 
 /** A receipt's sealed content opened to its record hash, or the semantic step's refusal reason. */
 export type OpenedRecordContentV1 =
-  | { ok: true; recordHash: string; recordContent: Record<string, unknown> }
+  | {
+      ok: true;
+      recordHash: string;
+      recordContent: Record<string, unknown>;
+      /** 3 only for a hash recomputed under record hash v3 (or a seal-only path claiming no content); the seal is over sealInputHash. */
+      sealedVersion?: SealedRecordHashVersion;
+    }
   | { ok: false; reason: string };
 
 function openRecordContentV1(recordContent: Record<string, unknown>): OpenedRecordContentV1 {
@@ -213,7 +220,7 @@ export function verifySlotReceiptCoreV1(
     layoutVersion: receipt.layoutVersion,
     layoutDigest,
     state96: receiptSplit.state96,
-    recordHash: recomputedRecordHash,
+    recordHash: sealInputHash(open.sealedVersion ?? 1, recomputedRecordHash),
     recordOpening: receipt.recordOpening,
   });
   const recomputedSealTag = sealTagOfV1(recomputedSeal);

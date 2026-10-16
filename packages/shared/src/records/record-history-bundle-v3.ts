@@ -9,9 +9,11 @@ import {
   type VerifySlotReceiptOptionsV2,
 } from '../proof/semantic-receipt-v2';
 import { SEMANTIC_RECEIPT_SCHEMA_V3, type SemanticReceiptV3 } from '../proof/semantic-receipt-v3';
+import { SLOT_ENCODING_VERSION_V1 } from '../proof/slot-encoding-v1';
 import { fromBase64Url, toBase64Url } from '../records-crypto/base64url';
 import { isHex32 } from '../records-crypto/platform-crypto';
-import { commitRecordContentV2, openRecordEntryV2 } from '../records-crypto/record-hash-v2';
+import { commitRecordContentV2, openRecordEntryV2, type RevealedLeafV2 } from '../records-crypto/record-hash-v2';
+import { commitRecordContentV3, openRecordEntryV3, type RecordItemV3 } from '../records-crypto/record-hash-v3';
 import {
   RecordKeyV1,
   entryRefsMatchV1,
@@ -43,8 +45,17 @@ import {
  * Reading needs the record key: every envelope is opened and its record hash
  * recomputed before the seal checks, which are v3's through the shared core.
  * Refusals carry a code and, where an entry is at fault, its seq.
+ *
+ * A record hash v3 record (card 10, F1) is read through the same bundle:
+ * `semantic-receipt/v5` is v4 with `recordHashVersion: 3`, and
+ * `semantic-receipt/v6` is v3 with `recordHashVersion: 3` and v3 items in
+ * place of leaves. A history is all v4 and v3 receipts or all v5 and v6;
+ * every hash of a v3 history is recomputed under v3 and sealed over
+ * sealInputHash(3, hash).
  */
 export const SEMANTIC_RECEIPT_SCHEMA_V4 = 'semantic-receipt/v4' as const;
+export const SEMANTIC_RECEIPT_SCHEMA_V5 = 'semantic-receipt/v5' as const;
+export const SEMANTIC_RECEIPT_SCHEMA_V6 = 'semantic-receipt/v6' as const;
 export const RECORD_HISTORY_BUNDLE_SCHEMA_V3 = 'record-history-bundle/v3' as const;
 export const RECORD_COPY_SCHEMA_V1 = 'pacspace-record-copy/v1' as const;
 /** A reader declares it reads encrypted records with this header set to `1` (ADR 0015 section 7). */
@@ -58,6 +69,18 @@ export interface SemanticReceiptV4 extends SlotReceiptCoreV1 {
   references?: unknown;
 }
 
+export interface SemanticReceiptV5 extends Omit<SemanticReceiptV4, 'schema'> {
+  schema: typeof SEMANTIC_RECEIPT_SCHEMA_V5;
+  recordHashVersion: 3;
+}
+
+export interface SemanticReceiptV6 extends Omit<SemanticReceiptV3, 'schema' | 'leaves'> {
+  schema: typeof SEMANTIC_RECEIPT_SCHEMA_V6;
+  recordHashVersion: 3;
+  items: RecordItemV3[];
+  revealed: RevealedLeafV2[];
+}
+
 export interface RefusedEnvelopeV1 {
   seq: number;
   recordHash: string;
@@ -66,7 +89,7 @@ export interface RefusedEnvelopeV1 {
 
 export interface RecordHistoryBundleV3 extends Omit<RecordHistoryBundleV1, 'schema' | 'receipts'> {
   schema: typeof RECORD_HISTORY_BUNDLE_SCHEMA_V3;
-  receipts: Array<SemanticReceiptV4 | SemanticReceiptV3>;
+  receipts: Array<SemanticReceiptV4 | SemanticReceiptV3 | SemanticReceiptV5 | SemanticReceiptV6>;
   recordType: string;
   /** The wire record id. */
   entityId: string;
@@ -102,18 +125,35 @@ export function isSlotReceiptV4(value: unknown): value is SemanticReceiptV4 {
   return !!r && r.schema === SEMANTIC_RECEIPT_SCHEMA_V4 && r.itemKind === 'slot-v1';
 }
 
+export function isSlotReceiptV5(value: unknown): value is SemanticReceiptV5 {
+  const r = value as Partial<SemanticReceiptV5> | null;
+  return !!r && r.schema === SEMANTIC_RECEIPT_SCHEMA_V5 && r.itemKind === 'slot-v1' && r.recordHashVersion === 3;
+}
+
+export function isSlotReceiptV6(value: unknown): value is SemanticReceiptV6 {
+  const r = value as Partial<SemanticReceiptV6> | null;
+  return !!r && r.schema === SEMANTIC_RECEIPT_SCHEMA_V6 && r.itemKind === 'slot-v1' && r.recordHashVersion === 3;
+}
+
+/** An envelope receipt of either version: v4 (record hash v2) or v5 (v3). */
+type EnvelopeReceipt = SemanticReceiptV4 | SemanticReceiptV5;
+const isEnvelopeReceipt = (value: unknown): value is EnvelopeReceipt => isSlotReceiptV4(value) || isSlotReceiptV5(value);
+const sealedVersionOf = (r: EnvelopeReceipt): 2 | 3 => (r.schema === SEMANTIC_RECEIPT_SCHEMA_V5 ? 3 : 2);
+const commitAt = (version: 2 | 3) => (version === 3 ? commitRecordContentV3 : commitRecordContentV2);
+
 /**
- * Opens a v4 receipt: the envelope this record key opens (each in turn),
- * the record hash recomputed from the content and salt key, and the outside
- * copies of `amends` and `references` against the content's.
+ * Opens a v4 or v5 receipt: the envelope this record key opens (each in
+ * turn), the record hash recomputed from the content and salt key under the
+ * receipt's version, and the outside copies of `amends` and `references`
+ * against the content's.
  */
 export async function openReceiptV4(
   receipt: unknown,
   input: { recordKey: RecordKeyV1; recordType: string; wireRecordId: string },
-): Promise<{ ok: true; recordHash: string; content: Record<string, unknown>; saltKey: string } | EncryptedReadRefusalV1> {
-  const r = receipt as SemanticReceiptV4;
+): Promise<{ ok: true; recordHash: string; content: Record<string, unknown>; saltKey: string; sealedVersion: 2 | 3 } | EncryptedReadRefusalV1> {
+  const r = receipt as EnvelopeReceipt;
   const seq = typeof r?.seq === 'number' ? r.seq : undefined;
-  if (!isSlotReceiptV4(r) || !isHex32(r.recordHash) || !Array.isArray(r.envelopes) || r.envelopes.length === 0) {
+  if (!isEnvelopeReceipt(r) || !isHex32(r.recordHash) || !Array.isArray(r.envelopes) || r.envelopes.length === 0) {
     return refuse('RECORD_HISTORY_RECEIPT_FORM', seq);
   }
   const kids = r.envelopes.map((e) => (e as { kid?: unknown })?.kid);
@@ -126,34 +166,36 @@ export async function openReceiptV4(
       last = refuse(opened.code, seq);
       continue;
     }
+    const sealedVersion = sealedVersionOf(r);
     let recordHash: string;
     try {
-      recordHash = (await commitRecordContentV2(opened.content, opened.saltKey)).recordHash;
+      recordHash = (await commitAt(sealedVersion)(opened.content, opened.saltKey)).recordHash;
     } catch {
       return refuse('RECORD_ENTRY_HASH_MISMATCH', seq);
     }
     if (recordHash !== r.recordHash) return refuse('RECORD_ENTRY_HASH_MISMATCH', seq);
     const refs = entryRefsMatchV1(opened.content, { amends: r.amends, references: r.references });
     if (!refs.ok) return refuse(refs.code, seq);
-    return { ok: true, recordHash, content: opened.content, saltKey: opened.saltKey };
+    return { ok: true, recordHash, content: opened.content, saltKey: opened.saltKey, sealedVersion };
   }
   return last;
 }
 
 /**
- * What a reader without the key checks of a v4 receipt (formats note N7):
- * the receipt's form and every envelope's shape, then v3's checks with the
- * stated record hash, so the seal, the chain and the inclusion are checked
- * and the content is not. A v4 receipt is always a transition, whose rule
- * check reads the words alone. Never throws.
+ * What a reader without the key checks of a v4 or v5 receipt (formats note
+ * N7): the receipt's form and every envelope's shape, then v3's checks with
+ * the stated record hash, so the seal, the chain and the inclusion are
+ * checked and the content is not. A v5 receipt's stated version picks the
+ * sealed version here, a path that claims no content. An envelope receipt is
+ * always a transition, whose rule check reads the words alone. Never throws.
  */
 export function checkSlotReceiptV4Sealed(
   receipt: unknown,
   options: VerifySlotReceiptOptionsV2,
 ): { ok: true; verification: SlotReceiptVerificationV2 } | EncryptedReadRefusalV1 {
-  const r = receipt as SemanticReceiptV4;
+  const r = receipt as EnvelopeReceipt;
   const seq = typeof r?.seq === 'number' ? r.seq : undefined;
-  if (!isSlotReceiptV4(r) || !isHex32(r.recordHash) || !Array.isArray(r.envelopes) || r.envelopes.length === 0) {
+  if (!isEnvelopeReceipt(r) || !isHex32(r.recordHash) || !Array.isArray(r.envelopes) || r.envelopes.length === 0) {
     return refuse('RECORD_HISTORY_RECEIPT_FORM', seq);
   }
   const kids = new Set<string>();
@@ -164,23 +206,57 @@ export function checkSlotReceiptV4Sealed(
     kids.add(shape.kid);
   }
   try {
-    const verification = verifySlotReceiptCoreV1(r, () => ({ ok: true, recordHash: r.recordHash, recordContent: {} }), options);
+    const verification = verifySlotReceiptCoreV1(r, () => ({ ok: true, recordHash: r.recordHash, recordContent: {}, sealedVersion: sealedVersionOf(r) }), options);
     return { ok: true, verification };
   } catch {
     return refuse('RECORD_HISTORY_RECEIPT_FORM', seq);
   }
 }
 
-/** A v4 receipt opened, then checked as v3 checks a receipt. */
+/** A v4 or v5 receipt opened, then checked as v3 checks a receipt. */
 export async function verifySlotReceiptV4(
   receipt: unknown,
   options: VerifySlotReceiptOptionsV2 & { recordKey: RecordKeyV1; recordType: string; wireRecordId: string },
 ): Promise<{ ok: true; opened: OpenedEntryV1; verification: SlotReceiptVerificationV2 } | EncryptedReadRefusalV1> {
   const opened = await openReceiptV4(receipt, options);
   if (!opened.ok) return opened;
-  const r = receipt as SemanticReceiptV4;
-  const verification = verifySlotReceiptCoreV1(r, () => ({ ok: true, recordHash: opened.recordHash, recordContent: opened.content }), options);
+  const r = receipt as EnvelopeReceipt;
+  const verification = verifySlotReceiptCoreV1(
+    r,
+    () => ({ ok: true, recordHash: opened.recordHash, recordContent: opened.content, sealedVersion: opened.sealedVersion }),
+    options,
+  );
   return { ok: true, opened: { seq: r.seq, recordHash: opened.recordHash, content: opened.content, saltKey: opened.saltKey }, verification };
+}
+
+/**
+ * A v6 receipt (a facts row of a v3 record) checked as v3 checks a receipt:
+ * every item opened, the hash recomputed under v3, and the seal over
+ * sealInputHash(3, hash). Never throws.
+ */
+export async function verifySlotReceiptV6(receipt: unknown, options: VerifySlotReceiptOptionsV2): Promise<SlotReceiptVerificationV2> {
+  const r = receipt as SemanticReceiptV6;
+  if (!isSlotReceiptV6(r) || r.encodingVersion !== SLOT_ENCODING_VERSION_V1) {
+    return {
+      verified: false,
+      level: null,
+      failedCheck: 'schema',
+      checks: { schema: false },
+      decodedState: null,
+      recomputedRecordHash: null,
+      recomputedSeal: null,
+      recomputedSealTag: null,
+      expectedSealTag: null,
+      recomputedItemHash: null,
+      reason: 'Receipt is not a semantic-receipt/v6 slot-v1 receipt at encoding version 1.',
+    };
+  }
+  const opened = await openRecordEntryV3(r, { every: true });
+  return verifySlotReceiptCoreV1(
+    r,
+    () => (opened.ok ? { ok: true, recordHash: opened.recordHash, recordContent: opened.content as Record<string, unknown>, sealedVersion: 3 } : { ok: false, reason: opened.reason }),
+    options,
+  );
 }
 
 /** keccak256(utf8(JCS(bundle without digest-ignored status fields))), as v1 and v2; `refused` and the ids included. */
@@ -188,11 +264,24 @@ export function computeBundleDigestV3(bundle: RecordHistoryBundleV3): string {
   return ethers.keccak256(ethers.toUtf8Bytes(canonicalizeJcs(digestableHistoryBundleV1(bundle as unknown as RecordHistoryBundleV1))));
 }
 
-/** Which receipt form each entry must take: v3 for attempt and failure rows, v4 for every transition. */
-function receiptFormRefusal(bundle: RecordHistoryBundleV3): EncryptedReadRefusalV1 | null {
+/** The record hash version of a history: 3 when any receipt is v5 or v6, else 2. */
+function historyVersionOf(bundle: RecordHistoryBundleV3): 2 | 3 {
+  return (bundle.receipts as Array<{ schema?: unknown }>).some(
+    (r) => r?.schema === SEMANTIC_RECEIPT_SCHEMA_V5 || r?.schema === SEMANTIC_RECEIPT_SCHEMA_V6,
+  )
+    ? 3
+    : 2;
+}
+
+/**
+ * Which receipt form each entry must take: in a v2 history, v3 for attempt
+ * and failure rows and v4 for every transition; in a v3 history, v6 and v5.
+ */
+function receiptFormRefusal(bundle: RecordHistoryBundleV3, version: 2 | 3): EncryptedReadRefusalV1 | null {
   const layout = bundle.layout;
+  const [rowForm, transitionForm] = version === 3 ? [SEMANTIC_RECEIPT_SCHEMA_V6, SEMANTIC_RECEIPT_SCHEMA_V5] : [SEMANTIC_RECEIPT_SCHEMA_V3, SEMANTIC_RECEIPT_SCHEMA_V4];
   for (const receipt of bundle.receipts as unknown[]) {
-    const r = receipt as { schema?: unknown; seq?: unknown; newWord?: unknown; itemKind?: unknown };
+    const r = receipt as { schema?: unknown; seq?: unknown; newWord?: unknown; itemKind?: unknown; recordHashVersion?: unknown };
     const seq = typeof r?.seq === 'number' ? r.seq : undefined;
     let kind: string;
     try {
@@ -202,9 +291,8 @@ function receiptFormRefusal(bundle: RecordHistoryBundleV3): EncryptedReadRefusal
     }
     const plaintextRow = kind === 'attempt' || kind === 'failure';
     if (r.itemKind !== 'slot-v1') return refuse('RECORD_HISTORY_RECEIPT_FORM', seq);
-    if (plaintextRow ? r.schema !== SEMANTIC_RECEIPT_SCHEMA_V3 : r.schema !== SEMANTIC_RECEIPT_SCHEMA_V4) {
-      return refuse('RECORD_HISTORY_RECEIPT_FORM', seq);
-    }
+    if (r.schema !== (plaintextRow ? rowForm : transitionForm)) return refuse('RECORD_HISTORY_RECEIPT_FORM', seq);
+    if (version === 3 ? r.recordHashVersion !== 3 : 'recordHashVersion' in r) return refuse('RECORD_HISTORY_RECEIPT_FORM', seq);
   }
   return null;
 }
@@ -248,26 +336,34 @@ export async function verifyRecordHistoryBundleV3(
   if (b.bundleDigest !== undefined && computeBundleDigestV3(b).toLowerCase() !== String(b.bundleDigest).toLowerCase()) {
     return refuse('RECORD_HISTORY_DIGEST');
   }
-  const form = receiptFormRefusal(b);
+  const version = historyVersionOf(b);
+  const form = receiptFormRefusal(b, version);
   if (form) return form;
 
   const ids = { recordKey: options.recordKey, recordType: b.recordType, wireRecordId: b.entityId };
   const openedBy = new Map<unknown, OpenedRecordContentV1>();
   const opened: OpenedEntryV1[] = [];
   for (const receipt of [...b.receipts].sort((x, y) => x.seq - y.seq)) {
-    if (receipt.schema === SEMANTIC_RECEIPT_SCHEMA_V4) {
+    if (isEnvelopeReceipt(receipt)) {
       const open = await openReceiptV4(receipt, ids);
       if (!open.ok) return open;
-      openedBy.set(receipt, { ok: true, recordHash: open.recordHash, recordContent: open.content });
+      openedBy.set(receipt, { ok: true, recordHash: open.recordHash, recordContent: open.content, sealedVersion: open.sealedVersion });
       opened.push({ seq: receipt.seq, recordHash: open.recordHash, content: open.content, saltKey: open.saltKey });
     } else {
-      const open = await openRecordEntryV2(receipt as SemanticReceiptV3, { every: true });
-      openedBy.set(receipt, open.ok ? { ok: true, recordHash: open.recordHash, recordContent: open.content as Record<string, unknown> } : { ok: false, reason: open.reason });
+      const open =
+        version === 3
+          ? await openRecordEntryV3(receipt as SemanticReceiptV6, { every: true })
+          : await openRecordEntryV2(receipt as SemanticReceiptV3, { every: true });
+      openedBy.set(
+        receipt,
+        open.ok ? { ok: true, recordHash: open.recordHash, recordContent: open.content as Record<string, unknown>, sealedVersion: version } : { ok: false, reason: open.reason },
+      );
       opened.push({ seq: receipt.seq, plaintext: true });
     }
   }
 
-  const rowSeqs = new Set(b.receipts.filter((r) => r.schema === SEMANTIC_RECEIPT_SCHEMA_V3).map((r) => r.seq));
+  const rowSchema = version === 3 ? SEMANTIC_RECEIPT_SCHEMA_V6 : SEMANTIC_RECEIPT_SCHEMA_V3;
+  const rowSeqs = new Set(b.receipts.filter((r) => r.schema === rowSchema).map((r) => r.seq));
   const held = [options.recordKey, ...(options.recordKeys ?? [])].filter((k): k is RecordKeyV1 => k instanceof RecordKeyV1);
   const refused: Array<{ seq: number; recordHash: string; opened: boolean }> = [];
   for (const item of b.refused as unknown[]) {
@@ -289,7 +385,7 @@ export async function verifyRecordHistoryBundleV3(
     if (!open.ok) return refuse(open.code, x.seq);
     let recordHash: string;
     try {
-      recordHash = (await commitRecordContentV2(open.content, open.saltKey)).recordHash;
+      recordHash = (await commitAt(version)(open.content, open.saltKey)).recordHash;
     } catch {
       return refuse('RECORD_ENTRY_HASH_MISMATCH', x.seq);
     }

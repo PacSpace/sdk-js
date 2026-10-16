@@ -26,6 +26,12 @@ export const RECORDS_ENCRYPTION_LABELS_V1 = {
   entry: 'pacspace:record-entry:v1',
 } as const;
 
+/** Card 10, F2: the content tag is keyed per version of the workspace secret. */
+export const RECORDS_CONTENT_TAG_LABELS_V2 = {
+  contentTagKey: 'pacspace:content-tag-key:v2',
+  contentTag: 'pacspace:content-tag:v2',
+} as const;
+
 export const RECORDS_ENCRYPTION_PAD_BLOCK_V1 = 256;
 export const RECORD_ENTRY_PLAINTEXT_MAX_BYTES_V1 = 47104;
 export const RECORD_ENTRY_CIPHERTEXT_MAX_BYTES_V1 = RECORD_ENTRY_PLAINTEXT_MAX_BYTES_V1 + 16;
@@ -128,6 +134,17 @@ export class RecordsWrapKeyV1 extends HiddenKey {
   }
 }
 
+/** The content-tag key of one version (card 10, F2): tags made under it say nothing under another version. */
+export class RecordsContentTagKeyV2 extends HiddenKey {
+  /** @internal */
+  constructor(mint: Mint, bytes: Uint8Array, readonly version: number) {
+    super(mint, bytes);
+  }
+  protected describe(): string {
+    return `[content tag key v${this.version}]`;
+  }
+}
+
 /**
  * `RK`: opens one record's envelopes and no other. `recordsKeyId` is the id
  * of the `K_v` that made it, or null for a key that arrived on its own (a
@@ -143,7 +160,7 @@ export class RecordKeyV1 extends HiddenKey {
   }
 }
 
-type AnyKey = RecordsIdKeyV1 | RecordsKeyV1 | RecordsWrapKeyV1 | RecordKeyV1;
+type AnyKey = RecordsIdKeyV1 | RecordsKeyV1 | RecordsWrapKeyV1 | RecordKeyV1 | RecordsContentTagKeyV2;
 
 function bytesOf(key: AnyKey): Uint8Array {
   const bytes = KEY_BYTES_OF.get(key);
@@ -193,14 +210,18 @@ export async function deriveRecordsIdKeyV1(secretV1: Uint8Array): Promise<Record
   return new RecordsIdKeyV1(MINT, await hkdf32(secretV1, new Uint8Array(0), L.idKey));
 }
 
-/** `K_v` and `W_v` of one version, with their ids. */
-export async function deriveRecordsKeysV1(secret: Uint8Array, version: number): Promise<{ recordsKey: RecordsKeyV1; wrapKey: RecordsWrapKeyV1 }> {
+type VersionKeys = { recordsKey: RecordsKeyV1; wrapKey: RecordsWrapKeyV1; contentTagKey: RecordsContentTagKeyV2 };
+
+/** `K_v`, `W_v` (with their ids) and the content-tag key of one version. */
+export async function deriveRecordsKeysV1(secret: Uint8Array, version: number): Promise<VersionKeys> {
   assertSecret(secret, version);
   const k = await hkdf32(secret, new Uint8Array(0), L.recordsKey);
   const w = await hkdf32(secret, new Uint8Array(0), L.wrapKey);
+  const t = await hkdf32(secret, new Uint8Array(0), RECORDS_CONTENT_TAG_LABELS_V2.contentTagKey);
   return {
     recordsKey: new RecordsKeyV1(MINT, k, version, await keyIdOf(L.recordsKeyId, k)),
     wrapKey: new RecordsWrapKeyV1(MINT, w, version, await keyIdOf(L.wrapKeyId, w)),
+    contentTagKey: new RecordsContentTagKeyV2(MINT, t, version),
   };
 }
 
@@ -233,15 +254,17 @@ export async function deriveRecordsIdKeyFromBaseV1(baseV1: CryptoKey): Promise<R
   return new RecordsIdKeyV1(MINT, await hkdf32From(baseV1, new Uint8Array(0), L.idKey));
 }
 
-/** `K_v` and `W_v` of one version, from its stored key. */
-export async function deriveRecordsKeysFromBaseV1(base: CryptoKey, version: number): Promise<{ recordsKey: RecordsKeyV1; wrapKey: RecordsWrapKeyV1 }> {
+/** `K_v`, `W_v` and the content-tag key of one version, from its stored key. */
+export async function deriveRecordsKeysFromBaseV1(base: CryptoKey, version: number): Promise<VersionKeys> {
   assertBaseKey(base);
   if (!Number.isSafeInteger(version) || version < 1) throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
   const k = await hkdf32From(base, new Uint8Array(0), L.recordsKey);
   const w = await hkdf32From(base, new Uint8Array(0), L.wrapKey);
+  const t = await hkdf32From(base, new Uint8Array(0), RECORDS_CONTENT_TAG_LABELS_V2.contentTagKey);
   return {
     recordsKey: new RecordsKeyV1(MINT, k, version, await keyIdOf(L.recordsKeyId, k)),
     wrapKey: new RecordsWrapKeyV1(MINT, w, version, await keyIdOf(L.wrapKeyId, w)),
+    contentTagKey: new RecordsContentTagKeyV2(MINT, t, version),
   };
 }
 
@@ -295,6 +318,24 @@ export async function contentTagV1(
     utf8(canonicalizeJcs({ content: input.content, lifecycle: input.lifecycle })),
   );
   return toBase64Url(await hmacSha256(bytesOf(idKey), message));
+}
+
+/**
+ * The content tag under the record's version (card 10, F2): HMAC of the
+ * version's content-tag key over "pacspace:content-tag:v2" || 0x00 ||
+ * recordType || 0x00 || wireRecordId || 0x00 || JCS({content, lifecycle}).
+ * The default caller reference, so it deduplicates within one version only.
+ */
+export async function contentTagV2(
+  contentTagKey: RecordsContentTagKeyV2,
+  input: { recordType: string; wireRecordId: string; content: Record<string, unknown>; lifecycle: string },
+): Promise<string> {
+  if (!(contentTagKey instanceof RecordsContentTagKeyV2)) throw new RecordsEncryptionError('RECORDS_KEY_INVALID');
+  const message = concatBytes(
+    utf8(RECORDS_CONTENT_TAG_LABELS_V2.contentTag), SEP, utf8(input.recordType), SEP, utf8(input.wireRecordId), SEP,
+    utf8(canonicalizeJcs({ content: input.content, lifecycle: input.lifecycle })),
+  );
+  return toBase64Url(await hmacSha256(bytesOf(contentTagKey), message));
 }
 
 // ------------------------------------------------------------------ the envelope (N5, N6)
@@ -528,6 +569,7 @@ export class RecordsKeyringV1 {
   readonly #byId = new Map<string, RecordsKeyV1>();
   readonly #byVersion = new Map<number, RecordsKeyV1>();
   readonly #wrap = new Map<number, RecordsWrapKeyV1>();
+  readonly #tag = new Map<number, RecordsContentTagKeyV2>();
 
   private constructor(readonly idKey: RecordsIdKeyV1) {}
 
@@ -548,10 +590,11 @@ export class RecordsKeyringV1 {
     return ring;
   }
 
-  #add({ recordsKey, wrapKey }: { recordsKey: RecordsKeyV1; wrapKey: RecordsWrapKeyV1 }): void {
+  #add({ recordsKey, wrapKey, contentTagKey }: VersionKeys): void {
     this.#byId.set(recordsKey.id, recordsKey);
     this.#byVersion.set(recordsKey.version, recordsKey);
     this.#wrap.set(wrapKey.version, wrapKey);
+    this.#tag.set(contentTagKey.version, contentTagKey);
   }
 
   /** The newest version: new records are made under it. */
@@ -573,6 +616,10 @@ export class RecordsKeyringV1 {
 
   wrapKey(version: number): RecordsWrapKeyV1 | null {
     return this.#wrap.get(version) ?? null;
+  }
+
+  contentTagKey(version: number): RecordsContentTagKeyV2 | null {
+    return this.#tag.get(version) ?? null;
   }
 
   toString(): string {

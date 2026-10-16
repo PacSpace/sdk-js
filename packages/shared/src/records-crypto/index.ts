@@ -20,6 +20,7 @@ export {
 } from './blinding-file';
 export { matchHeldFile, type HeldFile, type HeldFileMatch } from './held-file';
 export * from './record-hash-v2';
+export * from './record-hash-v3';
 export * from './record-disclosure-v1';
 export * from './disclosure-envelope-v1';
 export * from './wrap-shapes-v1';
@@ -38,6 +39,8 @@ export {
   RecordsKeyV1,
   RecordsWrapKeyV1,
   RecordKeyV1,
+  RecordsContentTagKeyV2,
+  RECORDS_CONTENT_TAG_LABELS_V2,
   RecordsKeyringV1,
   exportKeyBytesV1,
   generateWorkspaceSecretV1,
@@ -52,6 +55,7 @@ export {
   wireRecordIdV1,
   wireReferenceIdV1,
   contentTagV1,
+  contentTagV2,
   recordEntryPlaintextV1,
   padRecordEntryV1,
   sealRecordEntryV1,

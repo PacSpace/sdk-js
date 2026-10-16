@@ -17,11 +17,13 @@ import {
 } from '../proof/slot-encoding-v1';
 import {
   RECORD_DISCLOSURE_SCHEMA_V1,
+  RECORD_DISCLOSURE_SCHEMA_V2,
   buildRecordDisclosureV1,
   verifyRecordDisclosureV1,
   type ChainBatchRootsV1,
+  type RecordDisclosure,
   type RecordDisclosureRefusalV1,
-  type RecordDisclosureV1,
+  type RecordReceiptV3Items,
   type SealHistoryEntryForDisclosureV1,
   type SealHistoryFormForDisclosureV1,
 } from '../records-crypto/record-disclosure-v1';
@@ -34,7 +36,9 @@ import type { RecordLeafV2 } from '../records-crypto/record-hash-v2';
  * for a v2 record only, the record hash. It never carries content, an
  * opening, or a v1 record hash. Its digest is keccak256 over the JCS form of
  * every other field, so two reads give the same digest while nothing in the
- * record changed.
+ * record changed. A record hash v3 record (card 10, F1) carries
+ * `recordHashVersion: 3`; no other record carries the member, so v1 and v2
+ * forms are unchanged.
  */
 export const RECORD_SEAL_HISTORY_SCHEMA_V1 = 'record-seal-history/v1' as const;
 /** 5000 entries at about 2 KiB each stay under 10 MiB; a reader refuses a larger file before parsing it. */
@@ -69,6 +73,8 @@ export interface RecordSealHistoryV1 {
   recordKey: string;
   chain: { chainId: number; contractAddress: string };
   layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  /** Present, and 3, only for a record hash v3 record. */
+  recordHashVersion?: 3;
   currentWord: string | null;
   entries: RecordSealHistoryEntryV1[];
   pending: RecordSealHistoryPendingV1[];
@@ -133,6 +139,7 @@ export function buildRecordSealHistoryV1(input: {
   recordKey: string;
   chain: { chainId: number; contractAddress: string };
   layout: { layoutId: number; layoutVersion: number; layoutDigest: string };
+  recordHashVersion?: 1 | 2 | 3;
   currentWord: string | null;
   entries: RecordSealHistoryEntryV1[];
   pending: RecordSealHistoryPendingV1[];
@@ -157,6 +164,7 @@ export function buildRecordSealHistoryV1(input: {
     recordKey: input.recordKey.toLowerCase(),
     chain: { chainId: input.chain.chainId, contractAddress: input.chain.contractAddress.toLowerCase() },
     layout: { layoutId: input.layout.layoutId, layoutVersion: input.layout.layoutVersion, layoutDigest: input.layout.layoutDigest.toLowerCase() },
+    ...(input.recordHashVersion === 3 ? { recordHashVersion: 3 as const } : {}),
     currentWord: input.currentWord ? input.currentWord.toLowerCase() : null,
     entries,
     pending: input.pending.map((p) => ({ seq: p.seq, status: p.status })),
@@ -193,8 +201,9 @@ function entryShapeOk(e: unknown): e is RecordSealHistoryEntryV1 {
 
 function formShapeOk(form: unknown): form is RecordSealHistoryV1 {
   if (!isPlainObject(form)) return false;
-  if (!hasOnly(form, ['schema', 'recordKey', 'chain', 'layout', 'currentWord', 'entries', 'pending', 'digest'], ['ledger'])) return false;
+  if (!hasOnly(form, ['schema', 'recordKey', 'chain', 'layout', 'currentWord', 'entries', 'pending', 'digest'], ['ledger', 'recordHashVersion'])) return false;
   if (form.schema !== RECORD_SEAL_HISTORY_SCHEMA_V1 || !isHex32(form.recordKey) || !isHex32(form.digest)) return false;
+  if (form.recordHashVersion !== undefined && form.recordHashVersion !== 3) return false;
   const chain = form.chain;
   if (!isPlainObject(chain) || !hasOnly(chain, ['chainId', 'contractAddress']) || !isNatural(chain.chainId)) return false;
   if (typeof chain.contractAddress !== 'string' || !ADDRESS.test(chain.contractAddress)) return false;
@@ -456,17 +465,19 @@ export function findSealV1(form: RecordSealHistoryV1, value: string): number | n
 /**
  * R2's seal history form for verifyRecordDisclosureV1, from a seal history
  * that verified: exactly the entries whose seq the disclosure names, in seq
- * order, with `recordHash` on a v2 record's entries only. Null when a named
- * seq is not in the history, or a v2 entry has no served record hash.
+ * order, with `recordHash` on a v2 or v3 record's entries only, and the
+ * seal history's own `recordHashVersion` (never the disclosure's). Null when
+ * a named seq is not in the history, or such an entry has no served record
+ * hash.
  */
 export function disclosureFormOfV1(
   sealHistory: RecordSealHistoryV1,
-  disclosure: Pick<RecordDisclosureV1, 'recordHashVersion' | 'entries'>,
+  disclosure: Pick<RecordDisclosure, 'recordHashVersion' | 'entries'>,
 ): SealHistoryFormForDisclosureV1 | null {
   if (!disclosure || !Array.isArray(disclosure.entries)) return null;
   const bySeq = new Map(sealHistory.entries.map((e) => [e.seq, e] as const));
   const seqs = [...new Set(disclosure.entries.map((e) => e?.seq))].sort((a, b) => a - b);
-  const v2 = disclosure.recordHashVersion === 2;
+  const v2 = disclosure.recordHashVersion === 2 || disclosure.recordHashVersion === 3;
   const entries: SealHistoryEntryForDisclosureV1[] = [];
   for (const seq of seqs) {
     const e = bySeq.get(seq);
@@ -483,7 +494,13 @@ export function disclosureFormOfV1(
       batchId: e.batchId,
     });
   }
-  return { recordKey: sealHistory.recordKey, chain: { ...sealHistory.chain }, layout: { ...sealHistory.layout }, entries };
+  return {
+    recordKey: sealHistory.recordKey,
+    chain: { ...sealHistory.chain },
+    layout: { ...sealHistory.layout },
+    ...(sealHistory.recordHashVersion === 3 ? { recordHashVersion: 3 as const } : {}),
+    entries,
+  };
 }
 
 export const CHAIN_ROOT_READ_TIMEOUT_MS_V1 = 8000;
@@ -569,12 +586,12 @@ export type HeldCopyCheckV1 =
   | { kind: 'different-record' }
   | { kind: 'file' };
 
-const RECEIPT_SCHEMAS = new Set(['semantic-receipt/v2', 'semantic-receipt/v3']);
+const RECEIPT_SCHEMAS = new Set(['semantic-receipt/v2', 'semantic-receipt/v3', 'semantic-receipt/v6']);
 const BUNDLE_SCHEMAS = new Set(['record-history-bundle/v1', 'record-history-bundle/v2']);
 
 async function checkDisclosureAgainst(
   form: RecordSealHistoryV1,
-  disclosure: RecordDisclosureV1,
+  disclosure: RecordDisclosure,
   chainRoots: ChainBatchRootsV1,
 ): Promise<HeldEntryResultV1[]> {
   const sub = disclosureFormOfV1(form, disclosure);
@@ -592,10 +609,10 @@ async function checkDisclosureAgainst(
 
 async function checkReceipt(
   form: RecordSealHistoryV1,
-  receipt: RecordReceipt,
+  receipt: RecordReceipt | RecordReceiptV3Items,
   chainRoots: ChainBatchRootsV1,
 ): Promise<HeldEntryResultV1[]> {
-  let disclosure: RecordDisclosureV1;
+  let disclosure: RecordDisclosure;
   try {
     disclosure = await buildRecordDisclosureV1({
       recordKey: form.recordKey,
@@ -625,7 +642,7 @@ export async function checkHeldCopyV1(
   const sameRecord = (key: unknown) => typeof key === 'string' && key.toLowerCase() === form.recordKey;
   if (RECEIPT_SCHEMAS.has(schema)) {
     if (!sameRecord(held.recordKey)) return { kind: 'different-record' };
-    return { kind: 'entries', entries: await checkReceipt(form, held as unknown as RecordReceipt, options.chainRoots) };
+    return { kind: 'entries', entries: await checkReceipt(form, held as unknown as RecordReceipt | RecordReceiptV3Items, options.chainRoots) };
   }
   if (BUNDLE_SCHEMAS.has(schema)) {
     if (!sameRecord(held.recordKey)) return { kind: 'different-record' };
@@ -634,11 +651,11 @@ export async function checkHeldCopyV1(
     for (const receipt of receipts) entries.push(...(await checkReceipt(form, receipt, options.chainRoots)));
     return { kind: 'entries', entries };
   }
-  if (schema === RECORD_DISCLOSURE_SCHEMA_V1) {
+  if (schema === RECORD_DISCLOSURE_SCHEMA_V1 || schema === RECORD_DISCLOSURE_SCHEMA_V2) {
     if (!sameRecord(held.recordKey)) return { kind: 'different-record' };
     return {
       kind: 'entries',
-      entries: await checkDisclosureAgainst(form, held as unknown as RecordDisclosureV1, options.chainRoots),
+      entries: await checkDisclosureAgainst(form, held as unknown as RecordDisclosure, options.chainRoots),
     };
   }
   if (schema === 'record-link-copy/v1') {
@@ -648,7 +665,7 @@ export async function checkHeldCopyV1(
     if (!sameRecord(disclosure.recordKey)) return { kind: 'different-record' };
     return {
       kind: 'entries',
-      entries: await checkDisclosureAgainst(form, disclosure as unknown as RecordDisclosureV1, options.chainRoots),
+      entries: await checkDisclosureAgainst(form, disclosure as unknown as RecordDisclosure, options.chainRoots),
     };
   }
   return { kind: 'file' };

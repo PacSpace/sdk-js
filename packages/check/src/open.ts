@@ -4,7 +4,7 @@ import {
   decryptDisclosureV1,
   readDisclosureFragmentV1,
   RECORD_SEAL_HISTORY_SCHEMA_V1,
-  type RecordDisclosureV1,
+  type RecordDisclosure,
   type RecordSealHistoryV1,
 } from '@pacspace/shared';
 import { CHECKER_NAME, CHECKER_VERSION, checkHistory, HistoryFileError, parseHistoryFile, type CheckOptions, type RevealedEntry } from './check';
@@ -204,7 +204,7 @@ export function renderOpenHtml(input: { report: CheckReport; revealed: RevealedE
     ['Reference', report.record.reference],
     ['Fingerprint of this history', report.file.fingerprint ?? 'none'],
   ];
-  if (report.source.compared) facts.push(['Public source', report.source.readsFrom]);
+  if (report.source.compared) facts.push(['Proof layer', report.source.readsFrom]);
   const body: string[] = [
     '<h1>PacSpace record check</h1>',
     '<table>',
@@ -320,7 +320,7 @@ export async function runOpen(argv: string[], io: CliIo): Promise<number> {
     }
     if (!sealHistory || sealHistory.schema !== RECORD_SEAL_HISTORY_SCHEMA_V1) throw new OpenStop(NOT_A_LINK_SENTENCE, 2);
 
-    let disclosure: RecordDisclosureV1 | null = null;
+    let disclosure: RecordDisclosure | null = null;
     const answer = await request('/disclosure');
     if (answer.ok) {
       const envelope = ((await answer.json().catch(() => null)) as { envelope?: unknown } | null)?.envelope;
@@ -328,7 +328,7 @@ export async function runOpen(argv: string[], io: CliIo): Promise<number> {
         if (!link.key) throw new OpenStop(NO_KEY_SENTENCE, 2);
         const opened = await decryptDisclosureV1({ envelope, key: link.key, handle: link.handle });
         if (!opened.ok) throw new OpenStop(KEY_DOES_NOT_OPEN_SENTENCE, 2);
-        disclosure = opened.disclosure as RecordDisclosureV1;
+        disclosure = opened.disclosure as RecordDisclosure;
       }
     } else if (answer.status !== 404 || (await refusalOf(answer.clone())).code !== LINK_NOT_FOUND) {
       await stopWith(answer);

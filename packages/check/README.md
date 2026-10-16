@@ -1,7 +1,9 @@
 # @pacspace-io/check
 
-Checks a PacSpace record history file against the public source. It runs
-without PacSpace: the file and the public source are enough.
+Checks a PacSpace record history file against the proof layer: the
+independent infrastructure, outside PacSpace's control, where each record's
+seals are committed. It runs without PacSpace. The file and the proof layer
+are enough.
 
 A printed statement from a PacSpace Shared Record names this checker. With
 the history file the statement's reader downloaded and the fingerprint
@@ -28,10 +30,10 @@ The output is a few labeled facts and then plain sentences:
 Reference                    0x7777...7777
 Fingerprint of this history  0x7079...820d
 Exported                     2026-09-12T01:00:00.000Z (UTC)
-Public source                <the public source the record names>
+Proof layer                  <the proof layer mirror the record names>
 
 This record has 3 entries. All 3 are here, and all 3 match what was committed.
-Compared with the public source for this record: it matches.
+Compared with the proof layer for this record: it matches.
 Daily statement of 12 September 2026 (UTC): matches.
 The fingerprint you gave names this file.
 The check shows the record is unchanged since it was committed. It does not show that what was recorded was true.
@@ -46,13 +48,13 @@ The check shows the record is unchanged since it was committed. It does not show
    that lets the checker recompute what was committed for it and compare.
 3. Completeness. The record's own count says how many entries it has; the
    checker names any entry the file does not carry.
-4. The record against the public source. Unless `--offline`, the checker
-   reads the record's current state and the batches its entries were
-   committed in from the public source and compares the file with them.
+4. The record against the proof layer. Unless `--offline`, the checker
+   reads the record's current state and the groups its entries were
+   committed in from the proof layer and compares the file with them.
 5. The daily statement. A history file carries the daily statement that
    covered it at export. When that statement is still the current one the
    file alone proves it; otherwise `--full` reads every daily statement the
-   public source carries and compares.
+   proof layer carries and compares.
 
 The last sentence is always the same, because it is the boundary of the
 check: the check shows the record is unchanged since it was committed; it
@@ -64,15 +66,15 @@ A seal history, saved from a Shared Record link, and a kept copy from its Keep a
 
 ## Open a link
 
-npx @pacspace-io/check open asks for a Shared Record link, reads the record from the link's host, checks it against the public source and shows the fields the link reveals. If the link has an access code, it asks for that too. --copy saves a kept copy and --html saves the report as a page.
+npx @pacspace-io/check open asks for a Shared Record link, reads the record from the link's host, checks it against the proof layer and shows the fields the link reveals. If the link has an access code, it asks for that too. --copy saves a kept copy and --html saves the report as a page.
 
 An encrypted record's history is checked with its record key: npx @pacspace-io/check history.json --key record-key.txt. A copy made with keepCopy carries its key and is checked like any history file.
 
-npx @pacspace-io/check release checks the key pages a host serves against the release record on the ledger.
+npx @pacspace-io/check release checks the key pages a host serves against the release record PacSpace committed to the proof layer.
 
 release reads each file three ways, as the host sends it, and checks each answer and its headers against the production release record pinned in the checker. It proves what the host served to this run, not what it serves anyone else.
 
---release-record <key>,<chain>,<contract> checks a staging release record instead. Such a run never passes.
+--release-record <key>,<network>,<contract> checks a staging release record instead. Such a run never passes.
 
 ## Options
 
@@ -86,16 +88,16 @@ release reads each file three ways, as the host sends it, and checks each answer
 --access-code-file <path>  open: read the access code from this file instead of asking
 --copy <path>          open: save a kept copy of what the link shows to a new file
 --html <path>          open: save the report as a page that opens without a network connection
---release-record <key>,<chain>,<contract>  release: checks a staging release record; such a run never passes
---offline              check the file alone; do not read the public source
---source <url>         read the public source from this mirror
---rpc <url>            read the public source over JSON-RPC at this URL
---full                 also read the complete chain of daily statements
+--release-record <key>,<network>,<contract>  release: checks a staging release record; such a run never passes
+--offline              check the file alone; do not read the proof layer
+--source <url>         read the proof layer from this mirror
+--rpc <url>            read the proof layer over JSON-RPC at this URL
+--full                 also read every daily statement
 --timeout <ms>         network timeout per read (default 10000)
 --json                 print the report as JSON
 ```
 
-Exit codes: 0 the check passed as asked; 1 it did not, or the file you hold is not in it; 2 the history file, the link, a key, the file you hold, its blinding file or the arguments could not be used; 3 the public source or the link's host could not be reached. When more than one applies, 2 comes before 3, and 3 before 1.
+Exit codes: 0 the check passed as asked; 1 it did not, or the file you hold is not in it; 2 the history file, the link, a key, the file you hold, its blinding file or the arguments could not be used; 3 the proof layer or the link's host could not be reached. When more than one applies, 2 comes before 3, and 3 before 1.
 
 ## From code
 
@@ -111,12 +113,12 @@ if (report.exitCode !== 0) process.exitCode = report.exitCode;
 
 `report` is a `pacspace-check-report/v1` document: the record's count and
 the entries that matched, were missing, or did not match; whether the file
-is intact; what the public source said; the daily statement's outcome; the
+is intact; what the proof layer said; the daily statement's outcome; the
 fingerprint comparison; and the sentences printed above.
 
 ## What it needs
 
-Node.js 18 or later and the network, for the public source. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace. The public source for a record is named inside the history
+Node.js 20.19 or later, and the network, for the proof layer. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace. Where a record was committed is named inside the history
 file; `--source` and `--rpc` point the checker at a mirror or endpoint of
 your own.
 

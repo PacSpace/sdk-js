@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.14.0 - 2026-10-16
+
+### Changed
+
+- **Encrypted records move to format 2. Update every server that writes or reads encrypted records. 0.13.0 can no longer write encrypted records or add an encryption version.**
+- An encrypted write declares its record hash version. Encrypted records started after format 2 use record hash v3: each top-level field is sealed once, so a shown field has exactly one sealed value. Records that are not encrypted are unchanged.
+- Wraps to a holder, a grant reader or a link are bound to the owning workspace. Opening an encrypted record through a grant needs `owner`, the owning workspace's id; a missing or malformed id is refused before anything is sent (RECORDS_OWNER_INVALID).
+- records.shareKeyWrap() returns `fragment`. Add it to the link after `#`: a link opened through a wrap opens only the disclosure its fragment names.
+- records.rotate() adds the new version and its holder wraps in one request, and seals the seed of each key this workspace holds under it.
+- An encrypted write retried after its first attempt went under another version is sent again under the version the record uses.
+
+### Added
+
+- After this workspace's key is replaced on the key pages, reads and records.holdings.confirm() still open what was wrapped to its earlier keys.
+- RECORDS_SECRET_FILE_OUTDATED: "This workspace replaced its key. Use its new secret file on this server."
+- RECORDS_RETIRED_KEY_MISMATCH: "A retired key for this workspace doesn't match its listed code. Don't use it; contact PacSpace."
+- The records-encryption entry point exports replaceKey() and setUpKey() for the key pages. They run only through the dashboard, with the person's password.
+
 ## 0.13.0 - 2026-10-09
 
 ### Added

@@ -5,7 +5,7 @@ import {
   RECORD_DISCLOSURE_MAX_BYTES_V1,
   verifyRecordDisclosureV1,
   type ChainBatchRootsV1,
-  type RecordDisclosureV1,
+  type RecordDisclosure,
   type RecordDisclosureVerificationV1,
 } from '../records-crypto/record-disclosure-v1';
 import {
@@ -30,7 +30,7 @@ export const RECORD_LINK_COPY_MAX_BYTES_V1 = RECORD_SEAL_HISTORY_MAX_BYTES_V1 + 
 export interface RecordLinkCopyV1 {
   schema: typeof RECORD_LINK_COPY_SCHEMA_V1;
   sealHistory: RecordSealHistoryV1;
-  disclosure: RecordDisclosureV1 | null;
+  disclosure: RecordDisclosure | null;
 }
 
 export class RecordLinkCopyError extends Error {
@@ -48,7 +48,7 @@ const hasExactly = (v: Record<string, unknown>, keys: readonly string[]) => {
 };
 const toHex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 
-function sameRecord(sealHistory: RecordSealHistoryV1, disclosure: RecordDisclosureV1): boolean {
+function sameRecord(sealHistory: RecordSealHistoryV1, disclosure: RecordDisclosure): boolean {
   return (
     String(disclosure.recordKey).toLowerCase() === sealHistory.recordKey &&
     disclosure.chain?.chainId === sealHistory.chain.chainId &&
@@ -62,7 +62,7 @@ function sameRecord(sealHistory: RecordSealHistoryV1, disclosure: RecordDisclosu
 /** The copy, its bytes (utf8 of its JCS form), their SHA-256 as 64 lowercase hex, and their length. */
 export async function buildRecordLinkCopyV1(input: {
   sealHistory: RecordSealHistoryV1;
-  disclosure: RecordDisclosureV1 | null;
+  disclosure: RecordDisclosure | null;
 }): Promise<{ copy: RecordLinkCopyV1; bytes: Uint8Array; sha256: string; byteLength: number }> {
   if (!input || !isPlainObject(input.sealHistory) || input.sealHistory.schema !== RECORD_SEAL_HISTORY_SCHEMA_V1) {
     throw new RecordLinkCopyError('LINK_COPY_MALFORMED');

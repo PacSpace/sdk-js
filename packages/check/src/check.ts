@@ -19,6 +19,7 @@ import {
   recordKeyFromBytesV1,
   RECORD_COPY_SCHEMA_V1,
   RECORD_DISCLOSURE_SCHEMA_V1,
+  RECORD_DISCLOSURE_SCHEMA_V2,
   RECORD_HISTORY_BUNDLE_SCHEMA_V1,
   RECORD_HISTORY_BUNDLE_SCHEMA_V2,
   RECORD_HISTORY_BUNDLE_SCHEMA_V3,
@@ -35,7 +36,7 @@ import {
   type HeldFile,
   type LayoutRegistry,
   type RecordChainReader,
-  type RecordDisclosureV1,
+  type RecordDisclosure,
   type RecordHistoryBundleV1,
   type RecordHistoryBundleV2,
   type RecordHistoryBundleV3,
@@ -61,7 +62,7 @@ export const CHECKER_NAME = '@pacspace-io/check';
 export const CHECKER_VERSION: string =
   typeof __PACSPACE_CHECK_VERSION__ === 'string' ? __PACSPACE_CHECK_VERSION__ : '0.0.0-dev';
 
-/** The seven forms a history file names. */
+/** The eight forms a history file names. */
 export const HISTORY_SCHEMAS = [
   RECORD_HISTORY_BUNDLE_SCHEMA_V1,
   RECORD_HISTORY_BUNDLE_SCHEMA_V2,
@@ -70,12 +71,15 @@ export const HISTORY_SCHEMAS = [
   RECORD_SEAL_HISTORY_SCHEMA_V1,
   RECORD_LINK_COPY_SCHEMA_V1,
   RECORD_DISCLOSURE_SCHEMA_V1,
+  RECORD_DISCLOSURE_SCHEMA_V2,
 ] as const;
 export type HistorySchema = (typeof HISTORY_SCHEMAS)[number];
 
-/** W-L2g-27 */
+/** W-L2g-27, W-C10-B-21 */
 export const NOT_A_HISTORY_SENTENCE =
-  'This file is not a record history. A history file names its form as record-history-bundle/v1, record-history-bundle/v2, record-history-bundle/v3, pacspace-record-copy/v1, record-seal-history/v1, record-link-copy/v1 or record-disclosure/v1.';
+  'This file is not a record history. A history file names its form as record-history-bundle/v1, record-history-bundle/v2, record-history-bundle/v3, pacspace-record-copy/v1, record-seal-history/v1, record-link-copy/v1, record-disclosure/v1 or record-disclosure/v2.';
+/** W-C10-B-5: an encrypted record from before format 2 (card 10). */
+export const EARLIER_ENCRYPTED_FORMAT_SENTENCE = 'This record uses an earlier encrypted format that this checker no longer accepts.';
 /** W-L2g-1 */
 export const ENCRYPTED_NEEDS_KEY_SENTENCE =
   'This record is encrypted. Pass the file holding its record key with --key, or check a copy made with keepCopy.';
@@ -94,12 +98,12 @@ export const NOTHING_REVEALED_SENTENCE =
 export const DISCLOSURE_NEEDS_HISTORY_SENTENCE =
   "A disclosure is checked against the record's seals. Pass the history it came with, or a kept copy, with --history.";
 export const DISCLOSURE_OFFLINE_SENTENCE =
-  'The revealed fields are checked against the ledger, so they were not checked offline. Run this again without --offline.';
+  'The revealed fields are checked against the proof layer, so they were not checked offline. Run this again without --offline.';
 
 export interface CheckOptions {
   /**
-   * Where the public source is read from. `'mirror'` (the default) is the
-   * public mirror known for the record's network; a URL is a mirror base
+   * Where the proof layer is read from. `'mirror'` (the default) is the
+   * mirror known for the record's network; a URL is a mirror base
    * URL; `{ rpc }` is a JSON-RPC endpoint; `'offline'` skips the source and
    * checks the file alone.
    */
@@ -107,7 +111,7 @@ export interface CheckOptions {
   /** The fingerprint printed on a statement, to compare with this file's. */
   statementFingerprint?: string | null;
   /**
-   * Also read every daily statement the public source carries, so the
+   * Also read every daily statement the proof layer carries, so the
    * daily statement in the file can be compared even when later statements
    * exist, and the record's batches are checked to sit in that sequence.
    */
@@ -231,7 +235,7 @@ function readerFor(
   const chainId = chain?.chainId;
   const contractAddress = chain?.contractAddress;
   if (!contractAddress) {
-    throw new HistoryFileError('This file does not say where its record was committed, so the public source cannot be read.');
+    throw new HistoryFileError('This file does not say where its record was committed, so the proof layer cannot be read.');
   }
   const source = options.source ?? 'mirror';
   if (typeof source === 'object') {
@@ -243,7 +247,7 @@ function readerFor(
   const mirrorBaseUrl = source === 'mirror' ? (typeof chainId === 'number' ? MIRROR_NODE_BY_CHAIN[chainId] : undefined) : source;
   if (!mirrorBaseUrl) {
     throw new HistoryFileError(
-      `No public source is known for the network this file names (${chainId ?? 'none'}). Pass one with --source <url>.`,
+      `This file names a network the checker has no address for (${chainId ?? 'none'}). Pass one with --source <url>.`,
     );
   }
   return {
@@ -276,7 +280,7 @@ function disclosureNamesAFile(disclosure: unknown): boolean {
 /** The disclosure a file carries or is: a kept copy's, a bare disclosure, or none. */
 function disclosureOf(file: HistoryFile): unknown {
   if (file.schema === RECORD_LINK_COPY_SCHEMA_V1) return (file as { disclosure?: unknown }).disclosure ?? null;
-  if (file.schema === RECORD_DISCLOSURE_SCHEMA_V1) return file;
+  if (file.schema === RECORD_DISCLOSURE_SCHEMA_V1 || file.schema === RECORD_DISCLOSURE_SCHEMA_V2) return file;
   return null;
 }
 
@@ -302,7 +306,7 @@ export function needsLedgerRoots(file: HistoryFile): boolean {
  * fingerprint, its layout against the published documents, every entry or
  * seal, completeness, the daily statement it carries); then, unless offline,
  * the record's current state, its batches and any disclosure's batch roots
- * are read from the public source and the file is checked against them.
+ * are read from the proof layer and the file is checked against them.
  * Nothing is sent to PacSpace.
  */
 export async function checkHistory(file: HistoryFile, options: CheckOptions = {}): Promise<CheckReport> {
@@ -331,16 +335,17 @@ export async function checkHistory(file: HistoryFile, options: CheckOptions = {}
       if (!read.ok) throw new HistoryFileError('This is not a kept copy this version can read.');
       return checkSeals(file.schema, read.copy.sealHistory, read.copy.disclosure, options);
     }
-    case RECORD_DISCLOSURE_SCHEMA_V1: {
+    case RECORD_DISCLOSURE_SCHEMA_V1:
+    case RECORD_DISCLOSURE_SCHEMA_V2: {
       const against = options.history;
       if (!against) throw new HistoryFileError(DISCLOSURE_NEEDS_HISTORY_SENTENCE);
       if (against.schema === RECORD_SEAL_HISTORY_SCHEMA_V1) {
-        return checkSeals(file.schema, against as unknown as RecordSealHistoryV1, file as unknown as RecordDisclosureV1, options);
+        return checkSeals(file.schema, against as unknown as RecordSealHistoryV1, file as unknown as RecordDisclosure, options);
       }
       if (against.schema === RECORD_LINK_COPY_SCHEMA_V1) {
         const read = readRecordLinkCopyV1(against);
         if (!read.ok) throw new HistoryFileError('This is not a kept copy this version can read.');
-        return checkSeals(file.schema, read.copy.sealHistory, file as unknown as RecordDisclosureV1, options);
+        return checkSeals(file.schema, read.copy.sealHistory, file as unknown as RecordDisclosure, options);
       }
       throw new HistoryFileError(NOT_A_HISTORY_SENTENCE);
     }
@@ -525,9 +530,12 @@ function encryptedRefusalSentence(refusal: EncryptedReadRefusalV1): string | nul
  * An encrypted history (`record-history-bundle/v3`, alone with its key or
  * inside a copy file): every envelope opened and its record hash recomputed
  * before the seal checks, then, unless offline, the same reads from the
- * public source as a v2 history. The key stays in this function.
+ * proof layer as a v2 history. The key stays in this function.
  */
 async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, recordKey: RecordKeyV1, options: CheckOptions): Promise<CheckReport> {
+  const receipts: unknown[] = Array.isArray(bundle?.receipts) ? bundle.receipts : [];
+  const format2 = receipts.every((r) => ['semantic-receipt/v5', 'semantic-receipt/v6'].includes((r as { schema?: unknown })?.schema as string));
+  if (!format2) throw new HistoryFileError(EARLIER_ENCRYPTED_FORMAT_SENTENCE);
   const layouts = getPublishedLayoutRegistry();
   const notThisForm = file.schema === RECORD_COPY_SCHEMA_V1 ? NOT_A_COPY_FILE_SENTENCE : NOT_A_HISTORY_SENTENCE;
   const asFile = bundle as unknown as HistoryFile;
@@ -683,7 +691,7 @@ const pointerToken = (name: string) => name.replace(/~/g, '~0').replace(/\//g, '
 
 async function checkDisclosure(
   form: RecordSealHistoryV1,
-  disclosure: RecordDisclosureV1,
+  disclosure: RecordDisclosure,
   reader: RecordChainReader | null,
   onRevealed?: CheckOptions['onRevealed'],
 ): Promise<DisclosureOutcome> {
@@ -728,7 +736,7 @@ async function checkDisclosure(
 async function checkSeals(
   formName: HistorySchema,
   form: RecordSealHistoryV1,
-  disclosure: RecordDisclosureV1 | null,
+  disclosure: RecordDisclosure | null,
   options: CheckOptions,
 ): Promise<CheckReport> {
   const layouts = getPublishedLayoutRegistry();

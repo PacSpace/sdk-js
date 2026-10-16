@@ -23,6 +23,8 @@ import { RecordsEncryptionError } from './words';
 export const RECORDS_SUPPORT_HEADER = 'X-PacSpace-Records-Encryption';
 export const RECORDS_GRANT_HEADER = 'X-PacSpace-Grant';
 export const RECORDS_HOLDER_HEADER = 'X-PacSpace-Holder-For';
+/** The door's step-up proof (card 10, F4): replacing or setting up a key at the key pages only. */
+export const RECORDS_STEP_UP_HEADER = 'X-PacSpace-Step-Up';
 const ENCRYPTION = '/api/v1/records/encryption';
 
 /** Intake's sentences for the two caps (L2b), reused word for word before anything is sent. */
@@ -33,6 +35,24 @@ const SIZE_WORDS = {
 
 type RecordKey = Awaited<ReturnType<RecordsCrypto['recordKeyOfV1']>>;
 type Seed = Awaited<ReturnType<RecordsCrypto['workspaceSeedFromBytesV1']>>;
+type SeedWrapView = { version: number; wrap: unknown };
+/** GET identity: the current key (null after PacSpace retires it) and every retired one (card 10, F4). */
+type OwnIdentity = {
+  workspaceId?: string;
+  xwingPublic: string | null;
+  xwingPublicId: string | null;
+  seedWraps: SeedWrapView[];
+  retiredIdentities?: Array<{ xwingPublic: string; xwingPublicId: string; retiredAt: string; seedWraps: SeedWrapView[] }>;
+};
+/** What a key change returns: the new key, its code to read out, and the new version. */
+export interface KeyChange {
+  xwingPublicId: string;
+  code: string;
+  version: number;
+  kid: string;
+  holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }>;
+  holdersNeedingConfirmation: string[];
+}
 type Envelope = { kid?: unknown };
 type Receipt = Record<string, unknown> & { schema?: string; seq?: number; envelopes?: Envelope[] };
 
@@ -77,6 +97,12 @@ function kidsOf(receipts: Receipt[]): string[] {
   return kids;
 }
 
+/** An owner workspace id a wrap is bound to (card 10, F3), or W-C10-B-17 before any key is used. */
+function ownerOf(rc: RecordsCrypto, value: unknown): string {
+  if (typeof value !== 'string' || !rc.KEY_WRAP_OWNER_V2.test(value)) throw new RecordsEncryptionError('RECORDS_OWNER_INVALID');
+  return value;
+}
+
 export interface Pinned {
   workspaceId: string;
   publicKey: Uint8Array;
@@ -90,6 +116,12 @@ export interface Pinned {
 export class EncryptedRecords {
   /** A record's version, once known: `recordType \0 wireRecordId` to version. */
   private readonly versionOf = new Map<string, number>();
+  /**
+   * The record hash version intake took last (card 10, F1): 2 until intake
+   * says it takes only 3. A refusal on one names the other, once.
+   */
+  private hashVersion: 2 | 3 = 2;
+  private workspaceId: string | null = null;
 
   constructor(
     private readonly client: RecordsTransport,
@@ -147,18 +179,32 @@ export class EncryptedRecords {
     this.admit(recordType, lifecycle, content);
     const wireRecordId = await rc.wireRecordIdV1(ring.idKey, recordType, input.record);
     const saltKey = rc.newSaltKeyV2();
-    const { recordHash } = await rc.commitRecordContentV2(content, saltKey);
-    const contentTag = await rc.contentTagV1(ring.idKey, { recordType, wireRecordId, content, lifecycle });
-    const wireReferenceId = await rc.wireReferenceIdV1(ring.idKey, input.idempotencyKey ?? contentTag);
+    const recordHashes = {
+      2: (await rc.commitRecordContentV2(content, saltKey)).recordHash,
+      3: (await rc.commitRecordContentV3(content, saltKey)).recordHash,
+    };
     const outside: Record<string, unknown> = {};
     if (content.amends !== undefined) outside.amends = content.amends;
     if (content.references !== undefined) outside.references = content.references;
     const plaintextBytes = rc.recordEntryPlaintextV1(content, saltKey).length;
 
-    const bodyUnder = async (version: number) => {
+    // Card 10, F2: the tag is keyed by the record's version, and the default
+    // reference is made from it, so it deduplicates within one version only.
+    let wireReferenceId = '';
+    const bodyUnder = async (version: number, hashVersion: 2 | 3) => {
       const recordsKey = ring.byVersion(version);
-      if (!recordsKey) throw new RecordsEncryptionError('RECORDS_VERSION_NOT_HELD', { v: version });
-      const fields = { lifecycle, referenceId: wireReferenceId, recordHash, contentTag, ...outside };
+      const tagKey = ring.contentTagKey(version);
+      if (!recordsKey || !tagKey) throw new RecordsEncryptionError('RECORDS_VERSION_NOT_HELD', { v: version });
+      const contentTag = await rc.contentTagV2(tagKey, { recordType, wireRecordId, content, lifecycle });
+      wireReferenceId = await rc.wireReferenceIdV1(ring.idKey, input.idempotencyKey ?? contentTag);
+      const fields = {
+        lifecycle,
+        referenceId: wireReferenceId,
+        recordHash: recordHashes[hashVersion],
+        ...(hashVersion === 3 ? { recordHashVersion: 3 } : {}),
+        contentTag,
+        ...outside,
+      };
       const size = rc.checkEncryptedWriteSizeV1(fields, recordsKey.id, plaintextBytes);
       if (!size.ok) throw new PacSpaceError(SIZE_WORDS[size.code], 413, size.code);
       const recordKey = await rc.recordKeyOfV1(recordsKey, wireRecordId);
@@ -167,19 +213,45 @@ export class EncryptedRecords {
 
     const cacheKey = `${recordType}\0${wireRecordId}`;
     let version = this.versionOf.get(cacheKey) ?? ring.current.version;
+    let hashVersion = this.hashVersion;
+    let keyRetried = false;
+    let hashRetried = false;
+    let claimRetried = false;
     const path = recordPathOf(recordType, wireRecordId, '/transitions');
     let response: Record<string, unknown>;
-    try {
-      response = await this.client.post<Record<string, unknown>>(path, await bodyUnder(version), options);
-    } catch (error) {
-      const recordKid = apiErrorBody(error)?.recordKid;
-      if (!(error instanceof PacSpaceError) || error.code !== 'RECORD_ENCRYPTION_VERSION_MISMATCH' || typeof recordKid !== 'string') throw error;
-      const held = ring.byId(recordKid);
-      if (!held) throw new RecordsEncryptionError('RECORDS_VERSION_NOT_HELD', { v: await this.versionNumberOf(recordKid) });
-      version = held.version;
-      response = await this.client.post<Record<string, unknown>>(path, await bodyUnder(version), options);
+    for (;;) {
+      try {
+        response = await this.client.post<Record<string, unknown>>(path, await bodyUnder(version, hashVersion), options);
+        break;
+      } catch (error) {
+        if (!(error instanceof PacSpaceError)) throw error;
+        const otherHash =
+          (error.code === 'RECORD_HASH_VERSION_NOT_ENABLED' && hashVersion === 3) || (error.code === 'RECORD_FORMAT_RETIRED' && hashVersion === 2);
+        if (otherHash && !hashRetried) {
+          hashRetried = true;
+          hashVersion = hashVersion === 3 ? 2 : 3;
+          continue;
+        }
+        const body = apiErrorBody(error);
+        const claimKid = body?.claimKid;
+        if (error.code === 'IDEMPOTENCY_CONFLICT' && typeof claimKid === 'string' && !claimRetried) {
+          const claimed = ring.byId(claimKid);
+          if (!claimed) throw new RecordsEncryptionError('RECORDS_VERSION_NOT_HELD', { v: await this.versionNumberOf(claimKid), write: true });
+          if (claimed.version === version) throw error;
+          claimRetried = true;
+          version = claimed.version;
+          continue;
+        }
+        const recordKid = body?.recordKid;
+        if (keyRetried || error.code !== 'RECORD_ENCRYPTION_VERSION_MISMATCH' || typeof recordKid !== 'string') throw error;
+        const held = ring.byId(recordKid);
+        if (!held) throw new RecordsEncryptionError('RECORDS_VERSION_NOT_HELD', { v: await this.versionNumberOf(recordKid) });
+        keyRetried = true;
+        version = held.version;
+      }
     }
     this.versionOf.set(cacheKey, version);
+    this.hashVersion = hashVersion;
     return { response, wireRecordId, wireReferenceId };
   }
 
@@ -220,32 +292,46 @@ export class EncryptedRecords {
     const { rc, ring } = await this.keys.ring();
     const kids = kidsOf(receipts);
     if (read.grant) {
-      const seed = await this.ownSeed();
-      const got = unwrap<{ wrap?: unknown }>(
+      const owner = ownerOf(rc, read.owner);
+      const seeds = await this.ownSeeds();
+      const got = unwrap<{ rkid?: string; wrap?: unknown }>(
         await this.client.get(recordPathOf(record.recordType, record.wireRecordId, '/grant-key'), {
           ...options,
           headers: { [RECORDS_GRANT_HEADER]: read.grant },
         }),
       );
-      const opened = seed ? await rc.unwrapRecordKeyV1({ seed, wrap: got?.wrap, ...record }) : null;
-      if (!opened?.ok) throw new RecordsEncryptionError('RECORDS_ENTRY_UNOPENED', { seq: 1 });
-      return { rc, recordKey: opened.recordKey };
+      for (const seed of typeof got?.rkid === 'string' ? seeds : []) {
+        const opened = await rc.unwrapRecordKeyV2({ seed, wrap: got.wrap, owner, ...record, recordKeyId: got.rkid as string });
+        if (opened.ok) return { rc, recordKey: opened.recordKey };
+      }
+      throw new RecordsEncryptionError('RECORDS_ENTRY_UNOPENED', { seq: 1 });
     }
     if (read.holderFor) {
-      const seed = await this.ownSeed();
+      const owner = ownerOf(rc, read.holderFor);
+      const seeds = await this.ownSeeds();
       const { holdings } = unwrap<{ holdings: Holding[] }>(await this.client.get(`${ENCRYPTION}/holdings`, options));
       const versions: Array<{ version: number; recordKey: RecordKey }> = [];
       for (const holding of holdings ?? []) {
-        if (holding.ownerWorkspaceId !== read.holderFor || !seed) continue;
+        if (holding.ownerWorkspaceId !== owner) continue;
         for (const w of holding.wraps ?? []) {
           if (w.state === 'refused') continue;
-          if (holding.scope === 'record' && holding.record?.entityId === record.wireRecordId && holding.record.recordType === record.recordType) {
-            const opened = await rc.unwrapRecordKeyV1({ seed, wrap: w.wrap, ...record });
-            if (opened.ok) return { rc, recordKey: opened.recordKey };
-          }
-          if (holding.scope === 'workspace' && typeof w.version === 'number' && typeof w.kid === 'string' && (kids.length === 0 || kids.includes(w.kid))) {
-            const opened = await rc.unwrapRecordsKeyV1({ seed, wrap: w.wrap, version: w.version, recordsKeyId: w.kid });
-            if (opened.ok) versions.push({ version: w.version, recordKey: await rc.recordKeyOfV1(opened.recordsKey, record.wireRecordId) });
+          for (const seed of seeds) {
+            if (
+              holding.scope === 'record' &&
+              typeof w.rkid === 'string' &&
+              holding.record?.entityId === record.wireRecordId &&
+              holding.record.recordType === record.recordType
+            ) {
+              const opened = await rc.unwrapRecordKeyV2({ seed, wrap: w.wrap, owner, ...record, recordKeyId: w.rkid });
+              if (opened.ok) return { rc, recordKey: opened.recordKey };
+            }
+            if (holding.scope === 'workspace' && typeof w.version === 'number' && typeof w.kid === 'string' && (kids.length === 0 || kids.includes(w.kid))) {
+              const opened = await rc.unwrapRecordsKeyV2({ seed, wrap: w.wrap, owner, version: w.version, recordsKeyId: w.kid });
+              if (opened.ok) {
+                versions.push({ version: w.version, recordKey: await rc.recordKeyOfV1(opened.recordsKey, record.wireRecordId) });
+                break;
+              }
+            }
           }
         }
       }
@@ -292,7 +378,7 @@ export class EncryptedRecords {
     return { opened, recordKey, rc, sealsVerified: result.verification.verified };
   }
 
-  /** Opens one v4 receipt. */
+  /** Opens one v4 receipt, or a v3 record's v5 (card 10). */
   async openReceipt(
     receipt: Receipt,
     record: { recordType: string; wireRecordId: string },
@@ -336,30 +422,181 @@ export class EncryptedRecords {
 
   // ------------------------------------------------------------ identity and pins
 
-  async ownIdentity(): Promise<{ xwingPublic: string | null; xwingPublicId: string | null; seedWraps: Array<{ version: number; wrap: unknown }> }> {
+  async ownIdentity(): Promise<OwnIdentity> {
     return unwrap(await this.client.get(`${ENCRYPTION}/identity`));
   }
 
-  /** This workspace's seed, opened with its own secret; null when it has no identity. */
-  async ownSeed(ring?: Keyring): Promise<Seed | null> {
-    const { rc, ring: current } = await this.keys.ring();
-    const keyring = ring ?? current;
-    const own = await this.ownIdentity();
-    if (!own?.xwingPublicId) return null;
-    for (const seedWrap of own.seedWraps ?? []) {
-      const opened = await rc.openSeedWrapV1({ wrap: seedWrap.wrap, publicKeyId: own.xwingPublicId, keyring });
-      if (!opened.ok) continue;
-      if (own.xwingPublic !== b64u(opened.seed.publicKey)) break;
-      return opened.seed;
+  /** This workspace's own id, as the API names it: the owner every wrap it makes is bound to. */
+  async ownWorkspaceId(): Promise<string> {
+    if (!this.workspaceId) {
+      const { rc } = await this.keys.ring();
+      this.workspaceId = ownerOf(rc, (await this.ownIdentity())?.workspaceId);
     }
-    throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
+    return this.workspaceId;
   }
 
-  async registerVersions(): Promise<void> {
-    const { ring } = await this.keys.ring();
-    for (const version of ring.versions) {
-      await this.client.put(`${ENCRYPTION}/versions/${version}`, { kid: ring.byVersion(version)!.id });
+  /**
+   * One identity's seed, opened with `keyring`: null when no wrap opens,
+   * 'outdated' when every wrap is under a version the keyring doesn't hold.
+   * A seed that opens to another public key is `mismatch`'s refusal.
+   */
+  private async openSeedOf(
+    rc: RecordsCrypto,
+    keyring: Keyring,
+    identity: { xwingPublic: string | null; xwingPublicId: string | null; seedWraps?: SeedWrapView[] },
+    mismatch: 'RECORDS_IDENTITY_OTHER' | 'RECORDS_RETIRED_KEY_MISMATCH',
+  ): Promise<Seed | 'outdated' | null> {
+    if (!identity.xwingPublicId) return null;
+    const wraps = identity.seedWraps ?? [];
+    const held = wraps.filter((w) => keyring.versions.includes(w.version));
+    for (const seedWrap of held) {
+      const opened = await rc.openSeedWrapV1({ wrap: seedWrap.wrap, publicKeyId: identity.xwingPublicId, keyring });
+      if (!opened.ok) continue;
+      if (identity.xwingPublic !== b64u(opened.seed.publicKey)) throw new RecordsEncryptionError(mismatch);
+      return opened.seed;
     }
+    return held.length === 0 && wraps.length > 0 ? 'outdated' : null;
+  }
+
+  /** This workspace's seed, opened with its own secret; null when it has no current identity. */
+  async ownSeed(ring?: Keyring): Promise<Seed | null> {
+    const { rc, ring: current } = await this.keys.ring();
+    const own = await this.ownIdentity();
+    if (!own?.xwingPublicId) return null;
+    const seed = await this.openSeedOf(rc, ring ?? current, own, 'RECORDS_IDENTITY_OTHER');
+    if (seed === 'outdated') throw new RecordsEncryptionError('RECORDS_SECRET_FILE_OUTDATED');
+    if (!seed) throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
+    return seed;
+  }
+
+  /**
+   * Every seed this workspace's secret opens, current first, then each
+   * retired one (card 10, F4): a wrap made to a key before it was replaced
+   * still opens. A server still on the file before a replacement opens the
+   * retired seeds only; with none, W-C10-B-18.
+   */
+  async ownSeeds(): Promise<Seed[]> {
+    const { rc, ring } = await this.keys.ring();
+    const own = await this.ownIdentity();
+    const current = await this.openSeedOf(rc, ring, own, 'RECORDS_IDENTITY_OTHER');
+    const seeds: Seed[] = current && current !== 'outdated' ? [current] : [];
+    for (const retired of own.retiredIdentities ?? []) {
+      const seed = await this.openSeedOf(rc, ring, retired, 'RECORDS_RETIRED_KEY_MISMATCH');
+      if (seed && seed !== 'outdated') seeds.push(seed);
+    }
+    if (current === 'outdated' && seeds.length === 0) throw new RecordsEncryptionError('RECORDS_SECRET_FILE_OUTDATED');
+    if (own.xwingPublicId && current === null && seeds.length === 0) throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
+    return seeds;
+  }
+
+  /**
+   * The seed of each identity this workspace has had, sealed under
+   * `version` of `ring`: the current one must open; a retired one that
+   * doesn't is left out (a key PacSpace retired that this workspace never
+   * held). Undefined before the first identity.
+   */
+  private async seedWrapsFor(
+    rc: RecordsCrypto,
+    ring: Keyring,
+    version: number,
+    extra?: Seed,
+  ): Promise<Record<string, unknown> | undefined> {
+    const own = await this.ownIdentity();
+    const seeds: Seed[] = [];
+    if (own?.xwingPublicId) {
+      const current = await this.openSeedOf(rc, ring, own, 'RECORDS_IDENTITY_OTHER');
+      if (current === 'outdated') throw new RecordsEncryptionError('RECORDS_SECRET_FILE_OUTDATED');
+      if (!current) {
+        // A next file made from one older than a replacement reuses the
+        // replacement's version number; the file it came from lacks it.
+        const { ring: served } = await this.keys.ring();
+        if (served !== ring && (await this.openSeedOf(rc, served, own, 'RECORDS_IDENTITY_OTHER')) === 'outdated') {
+          throw new RecordsEncryptionError('RECORDS_SECRET_FILE_OUTDATED');
+        }
+        throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
+      }
+      seeds.push(current);
+    }
+    for (const retired of own?.retiredIdentities ?? []) {
+      const seed = await this.openSeedOf(rc, ring, retired, 'RECORDS_RETIRED_KEY_MISMATCH');
+      if (seed && seed !== 'outdated') seeds.push(seed);
+    }
+    if (extra) seeds.push(extra);
+    if (seeds.length === 0) return undefined;
+    const wrapKey = ring.wrapKey(version)!;
+    const out: Record<string, unknown> = {};
+    for (const seed of seeds) out[seed.publicKeyId] = await rc.sealSeedWrapV1(wrapKey, seed);
+    return out;
+  }
+
+  /** Registers each version of the secret the API doesn't list yet. */
+  async registerVersions(): Promise<void> {
+    const { rc, ring } = await this.keys.ring();
+    const listed = unwrap<{ versions?: Array<{ version: number }> }>(await this.client.get(`${ENCRYPTION}/versions`));
+    const registered = new Set((listed?.versions ?? []).map((v) => v.version));
+    for (const version of ring.versions) {
+      if (!registered.has(version)) await this.putVersion(rc, ring, version);
+    }
+  }
+
+  /**
+   * PUT versions in format 2 (card 10, F3): the version's records key
+   * wrapped to each workspace holder whose pin is held, with the holder set
+   * those wraps were made for; read again once if that set changed.
+   */
+  private async putVersion(
+    rc: RecordsCrypto,
+    ring: Keyring,
+    version: number,
+  ): Promise<{ holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }>; holdersNeedingConfirmation: string[] }> {
+    const recordsKey = ring.byVersion(version)!;
+    const seedWraps = await this.seedWrapsFor(rc, ring, version);
+    for (let attempt = 0; ; attempt += 1) {
+      const { holderSet, holders, holderWraps } = await this.holderWrapsFor(rc, recordsKey);
+      try {
+        const put = unwrap<{ holdersNeedingConfirmation?: string[] }>(
+          await this.client.put(`${ENCRYPTION}/versions/${version}`, {
+            kid: recordsKey.id,
+            wrapFormat: 2,
+            holderSet,
+            holderWraps,
+            ...(seedWraps ? { seedWraps } : {}),
+          }),
+        );
+        return { holders, holdersNeedingConfirmation: put?.holdersNeedingConfirmation ?? [] };
+      } catch (error) {
+        if (attempt === 0 && error instanceof PacSpaceError && error.code === 'RECORDS_HOLDER_SET_CHANGED') continue;
+        throw error;
+      }
+    }
+  }
+
+  /** The version's records key wrapped to each workspace holder whose pin is held, with the holder set those wraps were made for. */
+  private async holderWrapsFor(
+    rc: RecordsCrypto,
+    recordsKey: NonNullable<ReturnType<Keyring['byVersion']>>,
+  ): Promise<{
+    holderSet: string | undefined;
+    holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }>;
+    holderWraps: Array<{ holderId: string; pinnedId: string; wrap: unknown }>;
+  }> {
+    const owner = await this.ownWorkspaceId();
+    const listed = unwrap<{ holderSet?: string; holders?: HolderView[] }>(await this.client.get(`${ENCRYPTION}/holders`));
+    const holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }> = [];
+    const holderWraps: Array<{ holderId: string; pinnedId: string; wrap: unknown }> = [];
+    for (const holder of listed?.holders ?? []) {
+      if (holder.scope !== 'workspace' || holder.removedAt) continue;
+      try {
+        const pin = await this.pinned(holder.holderWorkspaceId);
+        if (pin.publicKeyId !== holder.pinnedId) throw new RecordsEncryptionError('RECORDS_PIN_CHANGED');
+        holderWraps.push({ holderId: holder.holderId, pinnedId: pin.publicKeyId, wrap: await rc.wrapRecordsKeyV2(pin.publicKey, recordsKey, owner) });
+        holders.push({ holderId: holder.holderId, workspaceId: holder.holderWorkspaceId, wrapped: true });
+      } catch (error) {
+        if (!(error instanceof RecordsEncryptionError)) throw error;
+        holders.push({ holderId: holder.holderId, workspaceId: holder.holderWorkspaceId, wrapped: false, code: error.code });
+      }
+    }
+    return { holderSet: listed?.holderSet, holders, holderWraps };
   }
 
   /** Registers this workspace's identity and every version of its secret. Idempotent. */
@@ -418,6 +655,7 @@ export class EncryptedRecords {
   ): Promise<{ holderId: string; created: boolean; wraps: Array<{ version: number | null; state: string }> }> {
     const { rc, ring } = await this.keys.ring();
     const pin = await this.pinned(input.workspaceId, input.confirmedCode);
+    const owner = await this.ownWorkspaceId();
     await this.registerVersions();
     const added = unwrap<{ holderId: string; created: boolean }>(
       await this.client.postNow(`${ENCRYPTION}/holders`, {
@@ -432,13 +670,13 @@ export class EncryptedRecords {
     const holderPath = `${ENCRYPTION}/holders/${encodeURIComponent(added.holderId)}/wraps`;
     if (input.scope === 'workspace') {
       for (const version of ring.versions) {
-        const wrap = await rc.wrapRecordsKeyV1(pin.publicKey, ring.byVersion(version)!);
+        const wrap = await rc.wrapRecordsKeyV2(pin.publicKey, ring.byVersion(version)!, owner);
         const stored = unwrap<{ state: string }>(await this.client.put(holderPath, { version, pinnedId: pin.publicKeyId, wrap }));
         wraps.push({ version, state: stored.state });
       }
     } else if (input.record) {
       const { recordKey } = await this.ownRecordKey(input.record.recordType, input.record.wireRecordId);
-      const wrap = await rc.wrapRecordKeyV1(pin.publicKey, recordKey, input.record);
+      const wrap = await rc.wrapRecordKeyV2(pin.publicKey, recordKey, input.record, owner);
       const stored = unwrap<{ state: string }>(await this.client.put(holderPath, { pinnedId: pin.publicKeyId, rkid: recordKey.id, wrap }));
       wraps.push({ version: null, state: stored.state });
     }
@@ -453,12 +691,14 @@ export class EncryptedRecords {
    */
   async confirmHoldings(): Promise<Array<{ holderId: string; version: number | null; state: string; reason?: string }>> {
     const { rc } = await this.keys.ring();
-    const seed = await this.ownSeed();
-    if (!seed) return [];
+    // A wrap made to a key before it was replaced still opens with that key's seed (card 10, F4).
+    const seeds = await this.ownSeeds();
+    if (seeds.length === 0) return [];
     const { holdings } = unwrap<{ holdings: Holding[] }>(await this.client.get(`${ENCRYPTION}/holdings`));
     const results: Array<{ holderId: string; version: number | null; state: string; reason?: string }> = [];
     for (const holding of holdings ?? []) {
       const base = `${ENCRYPTION}/holdings/${encodeURIComponent(holding.holderId)}`;
+      const owner = ownerOf(rc, holding.ownerWorkspaceId);
       for (const w of holding.wraps ?? []) {
         if (w.state !== 'stored') {
           results.push({ holderId: holding.holderId, version: w.version, state: w.state });
@@ -467,18 +707,25 @@ export class EncryptedRecords {
         let kid: string | null = null;
         let reason: 'unopened' | 'kid_mismatch' = 'unopened';
         if (holding.scope === 'workspace' && typeof w.version === 'number' && typeof w.kid === 'string') {
-          const opened = await rc.unwrapRecordsKeyV1({ seed, wrap: w.wrap, version: w.version, recordsKeyId: w.kid });
-          if (opened.ok) kid = w.kid;
-          else if (opened.code === 'KEY_WRAP_KEY_MISMATCH') reason = 'kid_mismatch';
-        } else if (holding.scope === 'record' && holding.record) {
-          const record = { recordType: holding.record.recordType, wireRecordId: holding.record.entityId };
-          const opened = await rc.unwrapRecordKeyV1({ seed, wrap: w.wrap, ...record });
-          if (opened.ok) {
-            kid = await this.kidOpenedBy(rc, opened.recordKey, record, holding.ownerWorkspaceId);
-            if (kid === 'none-yet') {
-              results.push({ holderId: holding.holderId, version: null, state: 'stored' });
-              continue;
+          for (const seed of seeds) {
+            const opened = await rc.unwrapRecordsKeyV2({ seed, wrap: w.wrap, owner, version: w.version, recordsKeyId: w.kid });
+            if (opened.ok) {
+              kid = w.kid;
+              break;
             }
+            if (opened.code === 'KEY_WRAP_KEY_MISMATCH') reason = 'kid_mismatch';
+          }
+        } else if (holding.scope === 'record' && holding.record && typeof w.rkid === 'string') {
+          const record = { recordType: holding.record.recordType, wireRecordId: holding.record.entityId };
+          for (const seed of seeds) {
+            const opened = await rc.unwrapRecordKeyV2({ seed, wrap: w.wrap, owner, ...record, recordKeyId: w.rkid });
+            if (!opened.ok) continue;
+            kid = await this.kidOpenedBy(rc, opened.recordKey, record, owner);
+            break;
+          }
+          if (kid === 'none-yet') {
+            results.push({ holderId: holding.holderId, version: null, state: 'stored' });
+            continue;
           }
         }
         if (kid) {
@@ -529,70 +776,140 @@ export class EncryptedRecords {
     const { rc, recordKey, history } = await this.ownRecordKey(record.recordType, record.wireRecordId);
     if (!history) return null;
     const pin = await this.pinned(workspaceId, confirmedCode);
-    return { pinnedId: pin.publicKeyId, rkid: recordKey.id, wrap: await rc.wrapRecordKeyV1(pin.publicKey, recordKey, record) };
+    const owner = await this.ownWorkspaceId();
+    return { pinnedId: pin.publicKeyId, rkid: recordKey.id, wrap: await rc.wrapRecordKeyV2(pin.publicKey, recordKey, record, owner) };
   }
 
   async disclosureWrap(handle: string, disclosureKey: Uint8Array, workspaceId: string, confirmedCode: string | undefined) {
     const { rc } = await this.keys.ring();
     const pin = await this.pinned(workspaceId, confirmedCode);
-    return { workspaceId, pinnedId: pin.publicKeyId, wrap: await rc.wrapDisclosureKeyV1(pin.publicKey, disclosureKey, handle) };
+    const owner = await this.ownWorkspaceId();
+    return { workspaceId, pinnedId: pin.publicKeyId, wrap: await rc.wrapDisclosureKeyV2(pin.publicKey, disclosureKey, handle, owner) };
   }
 
   /** A disclosure link's key from this workspace's wrap, or null when the sharer stored none for it. */
   async disclosureKeyFromWrap(handle: string): Promise<Uint8Array | null> {
     if (!this.keys.configured) return null;
     const { rc } = await this.keys.ring();
-    let got: { wrap?: unknown };
+    let got: { ownerWorkspaceId?: string; wrap?: unknown };
     try {
       got = unwrap(await this.client.postNow(`/api/v1/records/disclosures/key-wrap`, { handle }));
     } catch (error) {
       if (error instanceof PacSpaceError && (error.statusCode === 404 || error.statusCode === 409)) return null;
       throw error;
     }
-    const seed = await this.ownSeed();
-    if (!seed) return null;
-    const opened = await rc.unwrapDisclosureKeyV1({ seed, wrap: got?.wrap, handle });
-    return opened.ok ? opened.disclosureKey : null;
+    const owner = ownerOf(rc, got?.ownerWorkspaceId);
+    for (const seed of await this.ownSeeds()) {
+      const opened = await rc.unwrapDisclosureKeyV2({ seed, wrap: got?.wrap, owner, handle });
+      if (opened.ok) return opened.disclosureKey;
+    }
+    return null;
   }
 
   // ------------------------------------------------------------ rotate and re-key
 
-  async rotate(nextSource: RecordsSecretSource): Promise<{ version: number; kid: string; holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }> }> {
-    const { rc, ring } = await this.keys.ring();
+  async rotate(nextSource: RecordsSecretSource): Promise<{
+    version: number;
+    kid: string;
+    holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }>;
+    holdersNeedingConfirmation: string[];
+  }> {
+    const { next, newest } = await this.nextOf(nextSource);
+    const recordsKey = next.ring.byVersion(newest)!;
+    // The new version carries the seed of each key this workspace holds (card 10, F4).
+    const { holders, holdersNeedingConfirmation } = await this.putVersion(next.rc, next.ring, newest);
+    this.keys.replace(next);
+    return { version: newest, kid: recordsKey.id, holders, holdersNeedingConfirmation };
+  }
+
+  /** `nextSource` read and checked to add exactly the next version and keep every earlier one. */
+  private async nextOf(nextSource: RecordsSecretSource) {
+    const { ring } = await this.keys.ring();
     const next = await keyringOf(nextSource);
     const newest = Math.max(...next.ring.versions);
     const expected = [...ring.versions, Math.max(...ring.versions) + 1];
     const sameEarlier = ring.versions.every((v) => next.ring.byVersion(v)?.id === ring.byVersion(v)?.id);
     if (next.ring.versions.join(',') !== expected.join(',') || !sameEarlier) throw new RecordsEncryptionError('RECORDS_ROTATE_NOT_NEXT');
+    return { next, newest };
+  }
+
+  /**
+   * Replaces this workspace's key, at the key pages' door only (card 10,
+   * F4; design v5, D3 a): `stepUp` is the door's step-up proof. The API
+   * challenges the current key, this seed answers, and the new key and
+   * `nextSource`'s new version are written together. Save `nextSource`'s
+   * file before calling: it is the only secret that opens the new key.
+   */
+  async replaceKey(nextSource: RecordsSecretSource, stepUp: string): Promise<KeyChange> {
+    const { next, newest } = await this.nextOf(nextSource);
+    const rc = next.rc;
+    const current = await this.ownSeed();
+    if (!current) throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
+    const owner = await this.ownWorkspaceId();
+    const fresh = await rc.workspaceSeedFromBytesV1(globalThis.crypto.getRandomValues(new Uint8Array(32)));
+    const headers = { [RECORDS_STEP_UP_HEADER]: stepUp };
+    const challenge = unwrap<{ challengeId: string; enc: string; fromXwingPublicId: string }>(
+      await this.client.postNow(`${ENCRYPTION}/identity/rotations/challenge`, { xwingPublic: b64u(fresh.publicKey) }, { headers }),
+    );
+    if (challenge?.fromXwingPublicId !== current.publicKeyId) throw new RecordsEncryptionError('RECORDS_IDENTITY_OTHER');
+    const binding = { workspaceId: owner, fromId: current.publicKeyId, newId: fresh.publicKeyId, challengeId: challenge.challengeId };
+    const proof = await rc.rotationProofV1(current, challenge.enc, binding);
     const recordsKey = next.ring.byVersion(newest)!;
-    await this.client.put(`${ENCRYPTION}/versions/${newest}`, { kid: recordsKey.id });
-
-    const own = await this.ownIdentity();
-    if (own?.xwingPublicId && own.xwingPublic) {
-      const seed = await this.ownSeed(ring);
-      if (seed) {
-        const wrap = await next.rc.sealSeedWrapV1(next.ring.wrapKey(newest)!, seed);
-        await this.client.put(`${ENCRYPTION}/identity`, { xwingPublic: b64u(seed.publicKey), seedWrap: { version: newest, wrap } });
-      }
-    }
-
-    const holders: Array<{ holderId: string; workspaceId: string; wrapped: boolean; code?: string }> = [];
-    const listed = unwrap<{ holders: Array<HolderView> }>(await this.client.get(`${ENCRYPTION}/holders`));
-    for (const holder of listed.holders ?? []) {
-      if (holder.scope !== 'workspace' || holder.removedAt) continue;
-      try {
-        const pin = await this.pinned(holder.holderWorkspaceId);
-        if (pin.publicKeyId !== holder.pinnedId) throw new RecordsEncryptionError('RECORDS_PIN_CHANGED');
-        const wrap = await rc.wrapRecordsKeyV1(pin.publicKey, recordsKey);
-        await this.client.put(`${ENCRYPTION}/holders/${encodeURIComponent(holder.holderId)}/wraps`, { version: newest, pinnedId: pin.publicKeyId, wrap });
-        holders.push({ holderId: holder.holderId, workspaceId: holder.holderWorkspaceId, wrapped: true });
-      } catch (error) {
-        if (!(error instanceof RecordsEncryptionError)) throw error;
-        holders.push({ holderId: holder.holderId, workspaceId: holder.holderWorkspaceId, wrapped: false, code: error.code });
-      }
-    }
+    const seedWraps = await this.seedWrapsFor(rc, next.ring, newest, fresh);
+    const { holderSet, holders, holderWraps } = await this.holderWrapsFor(rc, recordsKey);
+    const done = unwrap<{ holdersNeedingConfirmation?: string[] }>(
+      await this.client.postNow(
+        `${ENCRYPTION}/identity/rotations`,
+        {
+          fromXwingPublicId: current.publicKeyId,
+          xwingPublic: b64u(fresh.publicKey),
+          challengeId: challenge.challengeId,
+          proof,
+          token: holderSet,
+          version: { number: newest, kid: recordsKey.id, seedWraps, holderWraps },
+        },
+        { headers },
+      ),
+    );
     this.keys.replace(next);
-    return { version: newest, kid: recordsKey.id, holders };
+    return {
+      xwingPublicId: fresh.publicKeyId,
+      code: await rc.holderKeyCodeV1(fresh.publicKey),
+      version: newest,
+      kid: recordsKey.id,
+      holders,
+      holdersNeedingConfirmation: done?.holdersNeedingConfirmation ?? [],
+    };
+  }
+
+  /**
+   * Sets up a new key after PacSpace retired this workspace's key at its
+   * request (card 10, F4; D4 a), at the door only, with `nextSource`'s new
+   * version. The new key's seed is sealed under that version only.
+   */
+  async setUpKey(nextSource: RecordsSecretSource, stepUp: string): Promise<KeyChange> {
+    const { next, newest } = await this.nextOf(nextSource);
+    const rc = next.rc;
+    const fresh = await rc.workspaceSeedFromBytesV1(globalThis.crypto.getRandomValues(new Uint8Array(32)));
+    const recordsKey = next.ring.byVersion(newest)!;
+    const seedWraps = await this.seedWrapsFor(rc, next.ring, newest, fresh);
+    const { holderSet, holders, holderWraps } = await this.holderWrapsFor(rc, recordsKey);
+    const done = unwrap<{ holdersNeedingConfirmation?: string[] }>(
+      await this.client.postNow(
+        `${ENCRYPTION}/identity/registrations`,
+        { xwingPublic: b64u(fresh.publicKey), token: holderSet, version: { number: newest, kid: recordsKey.id, seedWraps, holderWraps } },
+        { headers: { [RECORDS_STEP_UP_HEADER]: stepUp } },
+      ),
+    );
+    this.keys.replace(next);
+    return {
+      xwingPublicId: fresh.publicKeyId,
+      code: await rc.holderKeyCodeV1(fresh.publicKey),
+      version: newest,
+      kid: recordsKey.id,
+      holders,
+      holdersNeedingConfirmation: done?.holdersNeedingConfirmation ?? [],
+    };
   }
 
   /**
@@ -614,6 +931,7 @@ export class EncryptedRecords {
   }> {
     const { rc, ring } = await this.keys.ring();
     const record = { recordType: input.recordType, wireRecordId: input.wireRecordId };
+    const owner = await this.ownWorkspaceId();
     const toKey = ring.byVersion(input.toVersion);
     if (!toKey) throw new RecordsEncryptionError('RECORDS_VERSION_NOT_HELD', { v: input.toVersion });
     const history = await this.ownHistory(record.recordType, record.wireRecordId);
@@ -647,7 +965,7 @@ export class EncryptedRecords {
       if (grant.status !== 'ACTIVE' || grant.kind !== 'TENANT_BOUND' || !grant.counterpartyWorkspaceId || !grant.readerWrap) continue;
       try {
         const pin = await this.pinned(grant.counterpartyWorkspaceId);
-        const wrap = await rc.wrapRecordKeyV1(pin.publicKey, newKey, record);
+        const wrap = await rc.wrapRecordKeyV2(pin.publicKey, newKey, record, owner);
         await this.client.put(recordPathOf(record.recordType, record.wireRecordId, `/grants/${encodeURIComponent(grant.grantId)}/key-wrap`), {
           pinnedId: pin.publicKeyId,
           rkid: newKey.id,
@@ -667,7 +985,7 @@ export class EncryptedRecords {
       try {
         const pin = await this.pinned(holder.holderWorkspaceId);
         if (pin.publicKeyId !== holder.pinnedId) throw new RecordsEncryptionError('RECORDS_PIN_CHANGED');
-        const wrap = await rc.wrapRecordKeyV1(pin.publicKey, newKey, record);
+        const wrap = await rc.wrapRecordKeyV2(pin.publicKey, newKey, record, owner);
         await this.client.put(`${ENCRYPTION}/holders/${encodeURIComponent(holder.holderId)}/wraps`, { pinnedId: pin.publicKeyId, rkid: newKey.id, wrap });
         holders.push({ holderId: holder.holderId, wrapped: true });
       } catch (error) {
@@ -693,7 +1011,7 @@ interface Holding {
   ownerWorkspaceId: string;
   scope: 'workspace' | 'record';
   record: { recordType: string; entityId: string } | null;
-  wraps: Array<{ version: number | null; kid: string | null; wrap: unknown; state: string }>;
+  wraps: Array<{ version: number | null; kid: string | null; rkid?: string | null; wrap: unknown; state: string }>;
 }
 
 interface HolderView {

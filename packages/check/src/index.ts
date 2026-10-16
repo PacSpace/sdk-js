@@ -2,7 +2,7 @@
  * @pacspace-io/check: the checker a printed statement names (records buyer
  * posture plan, DfD-39 (A)). With a record's history file and the
  * fingerprint on the statement, the check can be run without the link,
- * without PacSpace, against the public source alone.
+ * without PacSpace, against the proof layer alone.
  */
 export {
   CHECKER_NAME,
