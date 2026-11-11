@@ -1,6 +1,6 @@
 # @pacspace-io/sdk
 
-Official TypeScript SDK for the [PacSpace Balance API](https://docs.pacspace.io). Zero dependencies, fully typed, built for Node.js 18+.
+Official TypeScript SDK for the [PacSpace API](https://docs.pacspace.io). Zero dependencies, fully typed, built for Node.js 18+.
 
 ## Install
 
@@ -11,26 +11,25 @@ npm install @pacspace-io/sdk
 ## Quick Start
 
 ```typescript
-import { PacSpace } from '@pacspace-io/sdk';
+import { PacSpace, fingerprint } from '@pacspace-io/sdk';
 
 const pac = new PacSpace({ apiKey: process.env.PACSPACE_API_KEY! });
 
-// Record a delta
-const delta = await pac.balance.emit('cust_123', -42.50, 'usage_charge');
-console.log(delta.receiptId); // Store for later verification
-
-// Derive balance
-const { computedBalance } = await pac.balance.derive('cust_123');
-
-// Compare against counterparty
-const report = await pac.balance.compare('cust_123', {
-  yours: 95000,
-  theirs: 98000,
+// Fingerprint a file and record an entry
+const { ref, blinding } = await fingerprint(fileBytes);
+const entry = await pac.records.emit({
+  record: 'build-1',
+  title: 'Handoff',
+  occurredAt: '2026-09-14T10:02:00Z',
+  actorId: 'ci',
+  payloads: [ref],
 });
 
-// Period-end checkpoint
-const checkpoint = await pac.balance.checkpoint('cust_123', {
-  period: '2026-02',
+// Read the history and check it in your process
+const history = await pac.records.history({ record: 'build-1' });
+const check = await pac.records.check({
+  history,
+  expect: [{ entry: 1, files: [{ source: fileBytes, blinding }] }],
 });
 ```
 
@@ -40,7 +39,7 @@ const checkpoint = await pac.balance.checkpoint('cust_123', {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `apiKey` | `string` | **required** | Your Balance API key (`pk_live_*` or `pk_test_*`) |
+| `apiKey` | `string` | **required** | Your PacSpace API key (`pk_live_*` or `pk_test_*`) |
 | `baseUrl` | `string` | `https://app.pacspace.io` | API base URL (overrides the key-based choice if provided) |
 | `sandboxUrl` | `string` | `https://app.pacspace.io` | Custom sandbox URL for a private sandbox host (used for `pk_test_*` keys) |
 | `productionUrl` | `string` | `https://app.pacspace.io` | Custom production URL (used for `pk_live_*` keys) |
@@ -49,24 +48,7 @@ const checkpoint = await pac.balance.checkpoint('cust_123', {
 | `timeout` | `number` | `30000` | Request timeout in ms |
 | `webhookSecret` | `string` | — | Webhook signing secret (enables `pac.webhooks`) |
 
-### Balance API
-
-#### `pac.balance.emit(customerId, delta, reason, options?)`
-
-Record a credit or debit delta. Returns immediately with `QUEUED` status.
-
-```typescript
-const delta = await pac.balance.emit('cust_123', -42.50, 'usage_charge', {
-  referenceId: 'inv_001',
-  metadata: { plan: 'growth' },
-});
-
-const adjustment = await pac.balance.emit('cust_123', -10, 'adjustment', {
-  adjusts: { referenceId: 'inv_001' },
-});
-```
-
-`adjusts` names the committed entry this delta adjusts, by that entry's `referenceId` or `recordId`. The original stays visible. The API refuses the write when the named entry is missing, pending, or out of scope.
+### Records
 
 #### `pac.records.emit({ record, title, occurredAt, actorId, payloads, amends? })`
 
@@ -85,9 +67,23 @@ const entry = await pac.records.emit({
 });
 ```
 
+The answer's `entry` is the number this entry will have in its record, counted from 1.
+
+`labels` puts up to 10 `name=value` pairs on the record, as an object (`{ model: 'm-0926' }`) or a string (`'model=m-0926, site=press-line-4'`, split on commas, semicolons or new lines, names lowercased). Labels go on the record, never in an entry, and are never committed. Names are lowercase letters, digits, `_`, `.` and `-`, up to 32 characters; values are letters, digits and `._:/-`, up to 64. Labels outside those limits are refused with `RECORD_LABELS_INVALID` before anything is sent. With a workspace secret set, each label is blinded under your workspace's key before it is sent: PacSpace can tell which records share a label, never what the label says.
+
+#### `pac.records.close(record, { recordType?, lastEntry? })`
+
+Closes a record. A close is a fact about the record, not an entry: nothing is written into the record. The close names the record's last entry, counted from 1. Left out, `lastEntry` is the last entry this process wrote to the record, or the record's own last entry, read from PacSpace. A close made while entries are still on their way is refused with `RECORD_CLOSE_SEQ_MISMATCH`; a write to a closed record is refused with `RECORD_CLOSED`. Closing again after the same entry returns `idempotent: true`. With a workspace secret set, the record is closed by its wire id; `encrypted: false` closes a plaintext record.
+
+```typescript
+await pac.records.emit({ record: 'session-12', title: 'Session 12', occurredAt, actorId: 'agent-7', payloads: [ref], labels: { model: 'm-0926' } });
+const closed = await pac.records.close('session-12');
+// closed.lastEntry, closed.closedAt, closed.lastSeal
+```
+
 `pac.records.receipt({ record, entry })`, `pac.records.history({ record, fromEntry?, toEntry? })`, and `check`'s `expect[].entry` count the same way. The history file itself is the wire document the check verifies by its digest, so its `receipts[].seq` and `entries[].seq` stay the wire's numbers; `check` reports each result as `entry` (`seq + 1`).
 
-`pac.records.history({ record })` returns the record's history file and `pac.records.check({ history, expect?, source? })` runs the check in your process: every seal, the chain between entries, the file's own digest, and the current word when `source` names the public source. The verifier is bundled into the SDK (0.10.0 and later); `ethers` is its one runtime dependency. Someone who holds only that file and the fingerprint printed on a statement, with no PacSpace account and no SDK, runs the same check with the standalone checker: `npx @pacspace-io/check history.json --fingerprint 0x...` ([`@pacspace-io/check`](https://www.npmjs.com/package/@pacspace-io/check)). It reads the public source and never calls PacSpace.
+`pac.records.history({ record })` returns the record's history file and `pac.records.check({ history, expect?, source? })` runs the check in your process: every seal, the chain between entries, the file's own digest, and the current word when `source` names the public source. On an encrypted record it first opens each entry with the record's key: the workspace secret's, or the one `grant` and `owner`, `recordKey` or `holderFor` name, as `history` takes them. The verifier is bundled into the SDK (0.10.0 and later); `ethers` is its one runtime dependency. Someone who holds only that file and the fingerprint printed on a statement, with no PacSpace account and no SDK, runs the same check with the standalone checker: `npx @pacspace-io/check history.json --fingerprint 0x...` ([`@pacspace-io/check`](https://www.npmjs.com/package/@pacspace-io/check)). It reads the public source and never calls PacSpace.
 
 #### `fingerprint(input, options?)`
 
@@ -103,71 +99,26 @@ blind: false, or alg: 'sha-256', gives today's plain sha-256 fingerprint as { re
 
 On Windows the blinding file's permissions are not restricted to you; keep it somewhere only you can read.
 
-#### `pac.balance.emitAndWait(customerId, delta, reason, options?)`
+#### `readWorkspaceSecretFile(path)`
 
-Record a delta and poll until it reaches a terminal status (`VERIFIED` or `FAILED`).
+readWorkspaceSecretFile() reads a workspace secret file and returns its text, for `records: { secret }`. Node only.
 
 ```typescript
-const verified = await pac.balance.emitAndWait('cust_123', -42.50, 'usage', {
-  timeout: 30_000,
-  pollInterval: 1000,
+import { PacSpace, readWorkspaceSecretFile } from '@pacspace-io/sdk';
+
+const pac = PacSpace.init(process.env.PACSPACE_API_KEY!, {
+  records: { secret: await readWorkspaceSecretFile('./pacspace-workspace-secret-sandbox-v1.json') },
 });
 ```
 
-#### `pac.balance.derive(customerId, options?)`
-
-Derive a customer's balance from all verified deltas.
-
-```typescript
-const result = await pac.balance.derive('cust_123');
-console.log(result.computedBalance);
-
-// With checkpointing for efficiency:
-const next = await pac.balance.derive('cust_123', {
-  startingBalance: result.computedBalance,
-  startingCheckpoint: result.latestReceiptId!,
-});
-```
-
-#### `pac.balance.compare(customerId, balances, options?)`
-
-Compare balances against neutral truth for dispute resolution.
-
-```typescript
-const report = await pac.balance.compare('cust_123', {
-  yours: 95000,
-  theirs: 98000,
-});
-
-if (report.matchesYours) {
-  console.log('Your balance is correct');
-}
-```
-
-#### `pac.balance.receipt(customerId, options?)`
-
-Generate a verifiable receipt. With `options.period` (YYYY-MM), returns a period-specific receipt with `proofRoot`, `verifyUrl`, and `verificationReference`. Treat `verifyUrl` as an opaque invoice link; when Shared Record is enabled it may point at a persistent `/c/{handle}` customer record instead of a proof-root URL.
-
-```typescript
-// Period receipt (shareable proof for invoices)
-const receipt = await pac.balance.receipt('cust_123', { period: '2026-02' });
-console.log(receipt.proofRoot);   // Proof root for verification
-console.log(receipt.verifyUrl);   // Share this opaque URL on invoices
-console.log(receipt.verificationApiUrl); // Machine endpoint for tools and auditors
-console.log(receipt.finalBalance);
-
-// Full record receipt (all verified deltas)
-const full = await pac.balance.receipt('cust_123');
-console.log(full.finalBalance);
-console.log(full.verification.itemHashes);
-```
+It reads the file under either name: Sandbox's `pacspace-workspace-secret-sandbox-v1.json`, or `pacspace-workspace-secret-v1.json`. A file that isn't a workspace secret is refused with RECORDS_SECRET_INVALID. workspaceSecretFileName(version, environment) gives the name the dashboard downloads it under.
 
 #### `pac.verify(proofRoot, options?)`
 
 Verify a proof root via the verification endpoint. No API key required. The response contains proof-only facts (validity, timestamps, and chain references); record contents are never returned here.
 
 ```typescript
-const result = await pac.verify(receipt.proofRoot);
+const result = await pac.verify('0x7f3a9b2c1d4e5f6a...');
 if (result.verified) {
   console.log(result.recordedAt);
   console.log(result.verification?.verificationExplorerUrl);
@@ -177,55 +128,8 @@ if (result.verified) {
 Use `options.source` to select the verification source:
 
 ```typescript
-await pac.verify(receipt.proofRoot, { source: 'both' }); // 'db' (default), 'chain', or 'both'
+await pac.verify('0x7f3a9b2c1d4e5f6a...', { source: 'both' }); // 'db' (default), 'chain', or 'both'
 ```
-
-Use `receipt.verifyUrl` for human invoice links. Use
-`receipt.verificationApiUrl` when a tool, agent, or auditor needs to call the
-machine verification endpoint. `receipt.verificationExplorerUrl` is a deprecated
-legacy compatibility field and will be retained until a future major version.
-
-#### `pac.balance.checkpoint(customerId?, options?)`
-
-Commit a period-end checkpoint. The proof root is recorded on the proof layer for independent verification.
-
-```typescript
-const checkpoint = await pac.balance.checkpoint('cust_123', {
-  period: '2026-02',
-});
-console.log(checkpoint.proofRoot); // Include in your invoice
-```
-
-#### Receipt access grants
-
-Issue separately revocable, optionally expiring authorizations for receipt
-retrieval. The grant token is returned once and only its hash is stored —
-share `grantUrl` with the counterparty and revoke the grant at any time to
-cut off later retrieval.
-
-```typescript
-// Issue a recipient-bound grant for an auditor, valid for 30 days
-const { grantUrl, grant } = await pac.balance.receipts.createGrant('chk_abc123', {
-  kind: 'RECIPIENT_BOUND',
-  recipientEmail: 'auditor@counterparty.com',
-  ttlHours: 24 * 30,
-  label: 'Q3 audit',
-});
-// Deliver grantUrl to the auditor; they confirm their email on retrieval.
-
-// List every path to a receipt (grants plus Shared Record step-up)
-const grants = await pac.balance.receipts.listGrants('chk_abc123');
-
-// Revoke when the engagement ends
-await pac.balance.receipts.revokeGrant('chk_abc123', grant.grantId, {
-  reason: 'engagement ended',
-});
-```
-
-Grant scopes control what the retrieved receipt carries: `SEMANTIC` (default)
-serves record contents with chain-correlation fields stripped, while
-`CHAIN_BEARING` produces a self-contained receipt that also carries the proof
-root and chain reference for independent verification (ADR 0008 §5).
 
 ### Webhooks
 
@@ -245,8 +149,8 @@ app.use('/webhooks', express.json({
 app.post('/webhooks/pacspace', pac.webhooks!.middleware(), (req, res) => {
   const event = (req as any).pacspaceEvent;
 
-  if (event.event === 'delta.verified') {
-    console.log('Delta verified:', event.data.receiptId);
+  if (event.event === 'record.committed') {
+    console.log('Record committed:', event.data.receiptId);
   }
 
   res.status(200).json({ received: true });
@@ -256,6 +160,8 @@ app.post('/webhooks/pacspace', pac.webhooks!.middleware(), (req, res) => {
 const event = pac.webhooks!.verify(signature, timestamp, rawBody);
 ```
 
+`record.closed` arrives when a record is closed, by your code or by PacSpace after the source's timeout: `{ recordType, entityId, closedBy, lastSeq, lastSeal, closedOn }`, where `closedBy` is `code` or `timeout` and `lastSeq` counts from 0, as the wire does.
+
 ### Error Handling
 
 All errors extend `PacSpaceError` with structured data:
@@ -264,7 +170,7 @@ All errors extend `PacSpaceError` with structured data:
 import { PacSpace, InsufficientCreditsError, RateLimitError } from '@pacspace-io/sdk';
 
 try {
-  await pac.balance.emit('cust_123', -1000, 'charge');
+  await pac.records.emit(input);
 } catch (err) {
   if (err instanceof InsufficientCreditsError) {
     console.log('Buy more credits');
@@ -282,7 +188,6 @@ try {
 | `NotFoundError` | 404 | Resource not found |
 | `ContractNotDeployedError` | 412 | No contract provisioned |
 | `RateLimitError` | 429 | Rate limit exceeded |
-| `TimeoutError` | — | Polling timeout exceeded |
 
 ## Environment Detection
 

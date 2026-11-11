@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.15.0 - 2026-11-11
+
+### Removed
+
+- Removed: the Balance resource (pac.balance), pac.customers, receipts and the submission scheduler; the Balance API is retired and answers 410.
+- Removed: the customer.created webhook type and CustomerCreatedPayload. PacSpace no longer sends customer.created; record.committed and record.failed are unchanged.
+
+### Added
+
+- readWorkspaceSecretFile(path) reads a workspace secret file for `records: { secret }`, under either name: Sandbox's `pacspace-workspace-secret-sandbox-v1.json`, or `pacspace-workspace-secret-v1.json`. workspaceSecretFileName(version, environment) gives the name the dashboard downloads it under.
+- records.emit() takes labels: up to 10 name=value pairs on the record, as an object or a string. They are checked before anything is sent, never go in an entry, and are never committed. With a workspace secret set, each label is blinded under the workspace's key before it is sent.
+- records.emit() returns entry, the number the entry will have in its record, counted from 1.
+- Added records.close(record, { recordType, lastEntry }). A close writes no entry. Without lastEntry, it closes after the last entry this process wrote to the record, or reads the record's last entry from PacSpace.
+- Added the record.closed webhook type and RecordClosedPayload.
+
+### Fixed
+
+- records.check() reads an encrypted record's history. It opens each entry with the record's key, then checks every seal, the chain between entries and the file's own digest, as it does for a record that is not encrypted. The key is the workspace secret's, or the one `grant` and `owner`, `recordKey` or `holderFor` name, as records.history() takes them. Through 0.14.0 it answered failedCheck: 'schema' for every encrypted history.
+- records.keepCopy() writes only what the history's digest covers, so the check notices a change to any value in the file. Through 0.14.0 the file also carried the list of entries with each one's status, which the digest does not cover, and a change there went unnoticed. Copies kept earlier still check.
+- A new client's first encrypted write declares record hash version 3. Through 0.14.0 it declared nothing (version 2), so on an API that takes only version 3 every new process paid one refused write (409 RECORD_FORMAT_RETIRED) before resending under 3. On an API with version 3 off, the first write is refused once with RECORD_HASH_VERSION_NOT_ENABLED and sent again under version 2, as before.
+
 ## 0.14.0 - 2026-10-16
 
 ### Changed

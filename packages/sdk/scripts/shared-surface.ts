@@ -9,7 +9,9 @@
 // same verifier. `records.disclose` adds the seal history, the kept copy and
 // each entry's kind (seals-first A) beside record hash v2's disclosure.
 // Encrypted records (L2d) add the v3 history's opener and intake's admission
-// check, which a client runs on the content before it encrypts.
+// check, which a client runs on the content before it encrypts. Labels (R3)
+// add the label grammar and limits, applied before a write is sent. The
+// reserved record forms are refused before an encrypted write blinds the name.
 export * from '../../shared/src/records/record-history-bundle-v1';
 export * from '../../shared/src/records/record-history-bundle-v2';
 export * from '../../shared/src/records/record-history-bundle-v3';
@@ -18,6 +20,8 @@ export { listPublishedLayouts } from '../../shared/src/records/layouts';
 export * from '../../shared/src/records/record-seal-history-v1';
 export * from '../../shared/src/records/record-link-copy-v1';
 export { recordEntryKindV1 } from '../../shared/src/records/record-entry-kind-v1';
+export { checkLabels, labelsUnreadable, parseLabels } from '../../shared/src/records/labels';
+export { RECORD_RESERVED_MESSAGE, isReservedRecordForm } from '../../shared/src/records/reserved-record-forms';
 export { getPublishedLayoutRegistry } from '../../shared/src/records/layouts';
 export { recordContentOfReceipt } from '../../shared/src/proof/semantic-receipt-v3';
 export * from '../../shared/src/demo/independent-verify-records';

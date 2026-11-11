@@ -4,9 +4,9 @@
 export type KnownWebhookEventType =
   | 'delta.verified'
   | 'delta.failed'
-  | 'customer.created'
   | 'record.committed'
-  | 'record.failed';
+  | 'record.failed'
+  | 'record.closed';
 
 /**
  * Event type union with forward-compat support for unknown future events.
@@ -126,11 +126,19 @@ export interface RecordFailedPayload {
   sentence: string;
 }
 
-export interface CustomerCreatedPayload {
-  customerId: string;
-  displayName: string;
-  source: 'manual';
-  createdAt: string;
+/**
+ * A record was closed, by your code (`records.close`) or by PacSpace after
+ * the source's timeout. A close writes no entry. `entityId` is the wire id
+ * of an encrypted record; `lastSeq` is the wire's number, counted from 0.
+ */
+export interface RecordClosedPayload {
+  recordType: string;
+  entityId: string;
+  closedBy: 'code' | 'timeout';
+  lastSeq: number;
+  lastSeal: string | null;
+  /** The day of the close, YYYY-MM-DD (UTC). */
+  closedOn: string;
 }
 
 /**
@@ -139,9 +147,9 @@ export interface CustomerCreatedPayload {
 export interface WebhookEventMap {
   'delta.verified': DeltaVerifiedPayload;
   'delta.failed': DeltaFailedPayload;
-  'customer.created': CustomerCreatedPayload;
   'record.committed': RecordCommittedPayload;
   'record.failed': RecordFailedPayload;
+  'record.closed': RecordClosedPayload;
 }
 
 /**

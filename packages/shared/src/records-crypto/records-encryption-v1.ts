@@ -308,6 +308,15 @@ export async function wireReferenceIdV1(idKey: RecordsIdKeyV1, referenceId: stri
   return wire16(idKey, concatBytes(utf8(L.referenceId), SEP, utf8(referenceId)));
 }
 
+/**
+ * A label blinded for an encrypted workspace (D-23): `b1:` and the base64url
+ * HMAC-SHA-256, under the id key, of `name=value`. The name is lowercased
+ * first, as `parseLabels` does. 46 characters.
+ */
+export async function blindedLabelV1(idKey: RecordsIdKeyV1, name: string, value: string): Promise<string> {
+  return `b1:${toBase64Url(await hmacSha256(bytesOf(idKey), utf8(`${name.toLowerCase()}=${value}`)))}`;
+}
+
 /** The keyed tag of an entry's content and lifecycle; the default caller reference. 43 characters. */
 export async function contentTagV1(
   idKey: RecordsIdKeyV1,

@@ -10,17 +10,3 @@ export interface RawApiResponse<T = unknown> {
   error?: string;
   statusCode?: number;
 }
-
-/**
- * Record verification lifecycle.
- */
-export type RecordStatus =
-  | 'QUEUED'
-  | 'PROCESSING'
-  | 'VERIFIED'
-  | 'FAILED';
-
-/**
- * Checkpoint type for balance derivation.
- */
-export type CheckpointType = 'proofRoot' | 'recordId';

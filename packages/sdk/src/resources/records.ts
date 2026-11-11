@@ -5,12 +5,15 @@ import {
   blindedDigest,
   buildRecordDisclosureV1,
   buildRecordLinkCopyV1,
+  checkLabels,
   computeRecordDisclosureDigest,
   createMirrorNodeRecordChainReader,
   createRpcRecordChainReader,
   disclosureFormOfV1,
   getPublishedLayoutRegistry,
+  labelsUnreadable,
   matchHeldFile,
+  parseLabels,
   readChainRootsV1,
   recordContentOfReceipt,
   recordEntryKindV1,
@@ -35,7 +38,7 @@ import { refuseBlindingMaterial } from '../blinding-guard';
 import type { HttpClient } from '../client';
 import { PacSpaceError, ValidationError, mapApiError } from '../errors';
 import { chunksOf, plainRef, type FingerprintInput } from '../fingerprint';
-import { EncryptedRecords } from '../records-encryption/encrypted-records';
+import { EncryptedRecords, readRefusal } from '../records-encryption/encrypted-records';
 import { RecordsKeys } from '../records-encryption/keys';
 import { memoryPinStore } from '../records-encryption/pin-store';
 import { RecordsEncryptionError } from '../records-encryption/words';
@@ -43,6 +46,8 @@ import type { RequestOptions } from '../types/config';
 import type {
   EntryNumber,
   RecordCheckInput,
+  RecordCloseOptions,
+  RecordCloseResponse,
   RecordCheckSource,
   RecordDiscloseInput,
   RecordDisclosureFile,
@@ -52,6 +57,7 @@ import type {
   RecordHistoryCheck,
   RecordHistoryEntry,
   RecordHistoryInput,
+  RecordLabels,
   RecordReadOptions,
   RecordReceiptInput,
   RecordReceiptResponse,
@@ -110,8 +116,36 @@ function payloadsOf(receipt: Record<string, unknown>): Array<{ alg?: string; dig
   return Array.isArray(payloads) ? payloads : [];
 }
 
+/** The payloads of an encrypted entry's content, as it was opened here. */
+function payloadsOfContent(content: Record<string, unknown> | undefined): Array<{ alg?: string; digest?: string; byteLength?: string }> {
+  const payloads = content?.payloads;
+  return Array.isArray(payloads) ? payloads : [];
+}
+
+/** The refusals of an encrypted history that are about the file's form, not about what an entry holds. */
+const ENCRYPTED_FORM_REFUSALS: ReadonlySet<string> = new Set([
+  'RECORD_HISTORY_RECEIPT_FORM',
+  'RECORD_HISTORY_WRONG_RECORD',
+  'RECORD_HISTORY_DIGEST',
+  'RECORD_COPY_MALFORMED',
+]);
+/** The shared verifier's sentence for a plaintext history whose digest does not recompute, word for word. */
+const BUNDLE_DIGEST_MISMATCH = 'Bundle digest does not match the bundle contents.';
+
 function fingerprintKey(ref: { alg?: string; digest?: string; byteLength?: string }): string {
   return `${ref.alg ?? ''}:${String(ref.digest ?? '').toLowerCase()}:${ref.byteLength ?? ''}`;
+}
+
+/** The API's sentence for RECORD_LABELS_INVALID, reused word for word before anything is sent. */
+const LABELS_INVALID = 'Labels are up to 10 key=value pairs. Keys are lowercase.';
+const CLOSE_NO_ENTRY = 'records.close found no entry on this record. Pass lastEntry, the number of its last entry, counted from 1.';
+
+/** The labels as name and value pairs, checked as the API checks them; refused before anything is sent. */
+function labelPairsOf(labels: RecordLabels): Array<[string, string]> {
+  const parsed = typeof labels === 'string' ? (labelsUnreadable(labels) ? null : parseLabels(labels)) : labels;
+  const checked = parsed ? checkLabels(parsed) : null;
+  if (!checked?.ok || checked.kind !== 'plain') throw new PacSpaceError(LABELS_INVALID, 422, 'RECORD_LABELS_INVALID');
+  return Object.entries(checked.labels);
 }
 
 const CHECK_NOTE = 'A blinded entry was not matched. Pass each file with its blinding file to check it.';
@@ -201,6 +235,8 @@ function disclosureKeyOf(value: Uint8Array | string): Uint8Array | null {
 
 export class RecordsResource {
   private readonly encrypted: EncryptedRecords;
+  /** The highest wire `seq` a write in this process was given: `recordType \0 path id` to seq. */
+  private readonly lastSeqOf = new Map<string, number>();
 
   /** This workspace's identity for encrypted records (ADR 0015, N14). */
   readonly identity: {
@@ -318,6 +354,7 @@ export class RecordsResource {
       content.amends = { recordKey: input.amends.recordKey, seq: seqOf(input.amends.entry, 'amends.entry') };
     }
     refuseBlindingMaterial(content);
+    const labels = input.labels !== undefined ? labelPairsOf(input.labels) : undefined;
 
     let response: Record<string, unknown>;
     let wire: { wireRecordId: string; wireReferenceId: string } | null = null;
@@ -329,6 +366,7 @@ export class RecordsResource {
           lifecycle: input.lifecycle ?? 'recorded',
           content,
           idempotencyKey: input.idempotencyKey,
+          labels,
         },
         options,
       );
@@ -340,11 +378,16 @@ export class RecordsResource {
         content,
       };
       if (input.idempotencyKey) body.referenceId = input.idempotencyKey;
+      if (labels) body.labels = Object.fromEntries(labels);
       response = await this.client.post<Record<string, unknown>>(
         recordPath(input.recordType, input.record, '/transitions'),
         body,
         options,
       );
+    }
+    if (typeof response.seq === 'number') {
+      const key = `${input.recordType || DEFAULT_RECORD_TYPE}\0${wire?.wireRecordId ?? input.record}`;
+      this.lastSeqOf.set(key, Math.max(response.seq, this.lastSeqOf.get(key) ?? -1));
     }
     const encryptedFields = wire
       ? { recordId: input.record, wireRecordId: wire.wireRecordId, wireReferenceId: wire.wireReferenceId, encrypted: true }
@@ -378,7 +421,42 @@ export class RecordsResource {
       receivedAt: typeof response.receivedAt === 'string' ? response.receivedAt : undefined,
       queuedViaOverflow: response.queuedViaOverflow === true,
       message: typeof response.message === 'string' ? response.message : undefined,
+      entry: entryOf(response.seq as number | undefined) ?? undefined,
       ...encryptedFields,
+    };
+  }
+
+  /**
+   * Closes a record as a fact about it (D-7): no entry is written. The close
+   * names the record's last entry, so it is refused while entries are still
+   * arriving. Left out, `lastEntry` is the last entry this process wrote to
+   * the record, or the record's own last entry, read from PacSpace.
+   */
+  async close(record: string, input: RecordCloseOptions = {}, options?: RequestOptions): Promise<RecordCloseResponse> {
+    const recordType = input.recordType || DEFAULT_RECORD_TYPE;
+    let lastSeq = input.lastEntry !== undefined ? seqOf(input.lastEntry, 'lastEntry') : undefined;
+    const target = await this.targetOf({ recordType, record, encrypted: input.encrypted });
+    lastSeq ??= this.lastSeqOf.get(`${recordType}\0${target.entityId}`);
+    if (lastSeq === undefined) {
+      const state = await this.client.get<{ lastSeq?: unknown }>(
+        recordPath(recordType, target.entityId, ''),
+        target.encrypted ? this.encrypted.requestOptions({}, options) : options,
+      );
+      if (typeof state?.lastSeq !== 'number') throw new ValidationError(CLOSE_NO_ENTRY);
+      lastSeq = state.lastSeq;
+    }
+    const response = await this.client.postNow<Record<string, unknown>>(recordPath(recordType, target.entityId, '/close'), { lastSeq }, options);
+    return {
+      recordType: String(response.recordType ?? recordType),
+      entityId: String(response.entityId ?? target.entityId),
+      recordKey: String(response.recordKey ?? ''),
+      closed: true,
+      closedBy: 'code',
+      closedAt: String(response.closedAt ?? ''),
+      lastEntry: entryOf(response.lastSeq as number | undefined) ?? lastSeq + 1,
+      lastSeal: typeof response.lastSeal === 'string' ? response.lastSeal : null,
+      idempotent: response.idempotent === true,
+      ...(target.encrypted ? { recordId: record, wireRecordId: target.entityId, encrypted: true } : {}),
     };
   }
 
@@ -602,31 +680,6 @@ export class RecordsResource {
       if (typeof receipt.seq === 'number') receiptsBySeq.set(receipt.seq, receipt);
     }
 
-    const blindingFileNeeded: EntryNumber[] = [];
-    const entryResults = entries.map((entry) => {
-      const result: RecordHistoryCheck['entries'][number] = {
-        entry: entryOf(entry.seq),
-        status: entry.status,
-        code: entry.code,
-        sentence: entry.sentence,
-      };
-      const wanted = entry.seq !== null ? expectBySeq.get(entry.seq) : undefined;
-      if (entry.seq !== null && wanted) {
-        const committed = payloadsOf(receiptsBySeq.get(entry.seq) ?? {});
-        const committedKeys = new Set(committed.map(fingerprintKey));
-        const payloadsOk = wanted.payloads.every((ref) => committedKeys.has(fingerprintKey(ref)));
-        let filesOk = true;
-        for (const held of wanted.held) {
-          const match = matchHeldFile(committed, held);
-          if (match.matched) continue;
-          filesOk = false;
-          if (match.blindingNeeded && !blindingFileNeeded.includes(entry.seq + 1)) blindingFileNeeded.push(entry.seq + 1);
-        }
-        result.expected = payloadsOk && filesOk;
-      }
-      return result;
-    });
-
     let failedCheck: string | null = null;
     let reason: string | undefined;
     let sourceChecked = false;
@@ -646,32 +699,86 @@ export class RecordsResource {
     }
 
     // The check itself: every seal, the chain between entries, the file's
-    // own digest, and the current word when the public source gave one. A
-    // verifier that throws confirms nothing; the result says so and is not ok.
+    // own digest, and the current word when the public source gave one. An
+    // encrypted record's history is opened first with the record's key, each
+    // entry checked against its sealed record hash, and its fingerprints are
+    // read from what was opened here, never from what the caller passed as
+    // `opened`. A verifier that throws confirms nothing; the result says so
+    // and is not ok.
+    const encrypted = (input.history as { schema?: unknown }).schema === RECORD_HISTORY_BUNDLE_SCHEMA_V3;
+    const openedBySeq = new Map<number, Record<string, unknown>>();
+    const kindBySeq = new Map<number, 'transition' | 'attempt' | 'failure'>();
     let bundleOk = false;
     try {
-      const verification = await verifyRecordHistoryBundle(history, chainWord !== undefined ? { chainWord } : {});
-      bundleOk = verification.verified;
-      const verifiedSeqs = new Set(
-        (verification.history?.perReceipt ?? []).filter((row) => row.result.verified).map((row) => row.seq),
-      );
-      for (const [index, entry] of entries.entries()) {
-        const receipt = entry.seq !== null && entry.status === 'committed' ? receiptsBySeq.get(entry.seq) : undefined;
-        entryResults[index].kind =
-          receipt && verifiedSeqs.has(entry.seq as number) && typeof receipt.newWord === 'string'
-            ? recordEntryKindV1(history.layout, receipt.newWord).kind
-            : null;
+      let verification: Awaited<ReturnType<typeof verifyRecordHistoryBundle>> | null = null;
+      if (encrypted) {
+        // `opened` and `nextFromSeq` are this SDK's additions to what was served; the digest covers neither.
+        const { opened: _opened, nextFromSeq: _nextFromSeq, ...served } = input.history;
+        const { grant, owner, recordKey, holderFor } = input;
+        const { result } = await this.encrypted.verifyHistory(
+          served as unknown as RecordHistoryBundleV3,
+          { grant, owner, recordKey, holderFor },
+          chainWord !== undefined ? { chainWord } : {},
+        );
+        if (result.ok) {
+          verification = result.verification;
+          for (const entry of result.opened) if ('content' in entry) openedBySeq.set(entry.seq, entry.content);
+        } else {
+          failedCheck = ENCRYPTED_FORM_REFUSALS.has(result.code) ? 'schema' : 'semantic';
+          reason = result.code === 'RECORD_HISTORY_DIGEST' ? BUNDLE_DIGEST_MISMATCH : readRefusal(result).message;
+        }
+      } else {
+        verification = await verifyRecordHistoryBundle(history, chainWord !== undefined ? { chainWord } : {});
       }
-      if (!verification.verified) {
-        failedCheck = verification.history?.perReceipt.find((row) => !row.result.verified)?.result.failedCheck
-          ?? (verification.schemaOk ? (verification.digestOk ? 'semantic' : 'schema') : 'schema');
-        reason = verification.reason;
+      if (verification) {
+        bundleOk = verification.verified;
+        const verifiedSeqs = new Set(
+          (verification.history?.perReceipt ?? []).filter((row) => row.result.verified).map((row) => row.seq),
+        );
+        for (const entry of entries) {
+          const receipt = entry.seq !== null && entry.status === 'committed' ? receiptsBySeq.get(entry.seq) : undefined;
+          if (receipt && verifiedSeqs.has(entry.seq as number) && typeof receipt.newWord === 'string') {
+            kindBySeq.set(entry.seq as number, recordEntryKindV1(history.layout, receipt.newWord).kind);
+          }
+        }
+        if (!verification.verified) {
+          failedCheck = verification.history?.perReceipt.find((row) => !row.result.verified)?.result.failedCheck
+            ?? (verification.schemaOk ? (verification.digestOk ? 'semantic' : 'schema') : 'schema');
+          reason = verification.reason;
+        }
       }
     } catch (error) {
       failedCheck = 'schema';
       reason = `The check did not finish: ${error instanceof Error ? error.message : String(error)}`;
     }
-    for (const row of entryResults) if (row.kind === undefined) row.kind = null;
+
+    const blindingFileNeeded: EntryNumber[] = [];
+    const entryResults = entries.map((entry) => {
+      const result: RecordHistoryCheck['entries'][number] = {
+        entry: entryOf(entry.seq),
+        status: entry.status,
+        code: entry.code,
+        sentence: entry.sentence,
+      };
+      const wanted = entry.seq !== null ? expectBySeq.get(entry.seq) : undefined;
+      if (entry.seq !== null && wanted) {
+        const committed = encrypted
+          ? payloadsOfContent(openedBySeq.get(entry.seq))
+          : payloadsOf(receiptsBySeq.get(entry.seq) ?? {});
+        const committedKeys = new Set(committed.map(fingerprintKey));
+        const payloadsOk = wanted.payloads.every((ref) => committedKeys.has(fingerprintKey(ref)));
+        let filesOk = true;
+        for (const held of wanted.held) {
+          const match = matchHeldFile(committed, held);
+          if (match.matched) continue;
+          filesOk = false;
+          if (match.blindingNeeded && !blindingFileNeeded.includes(entry.seq + 1)) blindingFileNeeded.push(entry.seq + 1);
+        }
+        result.expected = payloadsOk && filesOk;
+      }
+      result.kind = (entry.seq !== null && entry.status === 'committed' ? kindBySeq.get(entry.seq) : undefined) ?? null;
+      return result;
+    });
 
     const expectFailed = entryResults.some((row) => row.expected === false);
     if (expectFailed && !failedCheck) failedCheck = 'semantic';

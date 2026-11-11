@@ -1,10 +1,8 @@
 import { HttpClient } from './client';
-import { BalanceResource } from './resources/balance';
-import { CustomersResource } from './resources/customers';
 import { RecordsResource } from './resources/records';
 import { Webhooks } from './webhooks/verify';
 import type { PacSpaceConfig } from './types/config';
-import type { VerifyResponse, VerifySource } from './types/balance';
+import type { VerifyResponse, VerifySource } from './types/verify';
 
 /** Default production API base URL. */
 const DEFAULT_PRODUCTION_URL = 'https://app.pacspace.io';
@@ -16,31 +14,33 @@ const DEFAULT_PRODUCTION_URL = 'https://app.pacspace.io';
 const DEFAULT_SANDBOX_URL = DEFAULT_PRODUCTION_URL;
 
 /**
- * PacSpace SDK — the official TypeScript client for the PacSpace Balance API.
+ * PacSpace SDK: the official TypeScript client for the PacSpace API.
  *
  * @example
  * ```typescript
- * import { PacSpace } from '@pacspace-io/sdk';
+ * import { PacSpace, fingerprint } from '@pacspace-io/sdk';
  *
  * const pac = new PacSpace({ apiKey: process.env.PACSPACE_API_KEY! });
  *
- * // Record a delta
- * const delta = await pac.balance.emit('cust_123', -42.50, 'usage_charge');
- *
- * // Derive balance
- * const { computedBalance } = await pac.balance.derive('cust_123');
- *
- * // Compare against counterparty
- * const report = await pac.balance.compare('cust_123', {
- *   yours: 95000,
- *   theirs: 98000,
+ * // Record an entry
+ * const { ref, blinding } = await fingerprint(fileBytes);
+ * const entry = await pac.records.emit({
+ *   record: 'build-1',
+ *   title: 'Handoff',
+ *   occurredAt: '2026-09-14T10:02:00Z',
+ *   actorId: 'ci',
+ *   payloads: [ref],
  * });
  *
- * // Period-end receipt (shareable verification proof)
- * const receipt = await pac.balance.receipt('cust_123', { period: '2026-02' });
+ * // Read the history and check it in your process
+ * const history = await pac.records.history({ record: 'build-1' });
+ * const check = await pac.records.check({
+ *   history,
+ *   expect: [{ entry: 1, files: [{ source: fileBytes, blinding }] }],
+ * });
  *
  * // Verify a proof root (public, no auth)
- * const verification = await pac.verify(receipt.proofRoot);
+ * const verification = await pac.verify('0x7f3a9b2c1d4e5f6a...');
  * ```
  */
 export class PacSpace {
@@ -62,16 +62,6 @@ export class PacSpace {
   private readonly timeoutMs: number;
 
   /**
-   * Balance API resource — emit deltas, derive balances, compare, receipt, checkpoint.
-   */
-  readonly balance: BalanceResource;
-
-  /**
-   * Dashboard customer helpers.
-   */
-  readonly customers: CustomersResource;
-
-  /**
    * Records API resource — fingerprint a file, emit, read a receipt or history, check.
    */
   readonly records: RecordsResource;
@@ -86,7 +76,7 @@ export class PacSpace {
    * Create a new PacSpace SDK instance.
    *
    * @param config - SDK configuration.
-   * @param config.apiKey - Your Balance API key (required).
+   * @param config.apiKey - Your PacSpace API key (required).
    * @param config.baseUrl - API base URL (optional, overrides the key-based choice).
    * @param config.sandboxUrl - Custom sandbox URL (optional, used for `pk_test_*` keys; the default is the same host as production, where the key decides the environment).
    * @param config.productionUrl - Custom production URL (optional, used for `pk_live_*` keys).
@@ -115,8 +105,6 @@ export class PacSpace {
         this.baseUrl = (config.productionUrl || DEFAULT_PRODUCTION_URL).replace(/\/+$/, '');
       }
     }
-    this.balance = new BalanceResource(this.client, config.submission);
-    this.customers = new CustomersResource(this.client);
     this.records = new RecordsResource(this.client, config.records);
 
     if (config.webhookSecret) {
@@ -128,15 +116,13 @@ export class PacSpace {
    * Close the SDK client and reject buffered write requests.
    */
   close(reason?: string): void {
-    this.balance.stopSummaryScheduler();
     this.client.close(reason);
   }
 
   /**
-   * Graceful shutdown: flush summary queue and close the client.
+   * Graceful shutdown: an async alias of `close()`.
    */
   async shutdown(reason = 'SDK shutdown'): Promise<void> {
-    await this.balance.shutdownSummaryScheduler();
     this.client.close(reason);
   }
 
@@ -232,84 +218,15 @@ export class PacSpace {
 
 // Core
 export type { PacSpaceConfig, RequestOptions } from './types/config';
-export type { RecordStatus, CheckpointType } from './types/common';
 
-// Balance API
+// Verify
 export type {
-  AdjustsRef,
-  EmitOptions,
-  EmitAndWaitOptions,
-  EmitResponse,
-  DeriveOptions,
-  DeriveResponse,
-  VerifiedDelta,
-  WindowSummary,
-  CompareOptions,
-  CompareBalances,
-  CompareResponse,
-  DiscrepancyReport,
-  ReceiptResponse,
-  ReceiptDocument,
-  ReceiptStatementRow,
-  ReceiptDailyTotal,
-  ReceiptListItem,
-  ReceiptGetOptions,
-  ReceiptListOptions,
-  ReceiptGrantKind,
-  ReceiptGrantScope,
-  ReceiptGrantStatus,
-  ReceiptAccessGrant,
-  CreateReceiptGrantParams,
-  CreateReceiptGrantResponse,
-  CheckpointOptions,
-  CheckpointResponse,
-  CheckpointTimelinePoint,
-  CheckpointTimelineGap,
-  CheckpointTimelineResponse,
-  ListCheckpointTimelineOptions,
-  CheckpointDiffResponse,
-  DeltaStatusResponse,
-  WaitForVerifiedOptions,
-  UsageResponse,
-  SequenceGapsOptions,
-  SequenceGapRange,
-  SequenceGapsResponse,
-  ListWebhookDeliveriesOptions,
-  ListWebhookDeliveriesResponse,
-  CustomerRecordSummary,
-  CustomerRecordDetail,
-  CustomerRecordActivity,
-  ListCustomersOptions,
-  ListCustomersResponse,
-  GetCustomerOptions,
-  InvoiceProofOptions,
-  InvoiceProofResponse,
-  InvoiceProofDelta,
-  InvoiceProofWindowSummary,
-  InvoiceProofVerification,
   VerifySource,
   VerifyResponse,
   VerifySummary,
   VerifyRecord,
   VerifyVerification,
-} from './types/balance';
-export type {
-  CreateCustomerOptions,
-  CreateCustomerResponse,
-  CustomerEventCadence,
-  CustomerSharingState,
-} from './resources/customers';
-
-export type {
-  SubmissionProfile,
-  SubmissionAutomationOptions,
-  CustomerUsageSummary,
-  QueuedUsageSummary,
-  FlushSummariesOptions,
-  SummaryFlushFailure,
-  SummaryFlushResult,
-  SubmissionQueueState,
-} from './types/submission';
+} from './types/verify';
 
 // Errors
 export {
@@ -343,9 +260,9 @@ export type {
   WebhookHeaders,
   DeltaVerifiedPayload,
   DeltaFailedPayload,
-  CustomerCreatedPayload,
   RecordCommittedPayload,
   RecordFailedPayload,
+  RecordClosedPayload,
 } from './webhooks/types';
 
 export { fingerprint } from './fingerprint';
@@ -372,12 +289,16 @@ export type {
   RecordHistoryCheck,
   RecordHistoryInput,
   RecordLifecycle,
+  RecordLabels,
+  RecordCloseOptions,
+  RecordCloseResponse,
   RecordReceiptInput,
   RecordReceiptResponse,
   RecordReadOptions,
   OpenedRecordEntry,
 } from './types/records';
 export { generateWorkspaceSecret, nextWorkspaceSecret } from './records-encryption/workspace-secret';
+export { readWorkspaceSecretFile, workspaceSecretFileName, type WorkspaceSecretEnvironment } from './workspace-secret-file';
 export { memoryPinStore } from './records-encryption/pin-store';
 export { filePinStore } from './records-encryption/pin-store-file';
 export type { RecordsPin, RecordsPinStore } from './records-encryption/pin-store';

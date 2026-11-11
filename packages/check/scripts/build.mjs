@@ -41,14 +41,37 @@ const common = {
   legalComments: 'none',
 };
 
+// The evidence command checks a device's ML-DSA-65 signature with the
+// asymmetric layer, which needs a pinned library. The CLI and the library load
+// it at run time from the sibling dist/records-crypto.js, so neither bundles
+// any of the pinned libraries: the loader is replaced here by a require of
+// that file.
+const deviceSignatureLoader = resolve(root, 'src/evidence/device-signature.ts');
+const RECORDS_CRYPTO_SUBPATH = './records-crypto.js';
+const loaderPlugin = {
+  name: 'records-crypto-loader',
+  setup(b) {
+    b.onLoad({ filter: /evidence[\\/]device-signature\.ts$/ }, (args) => {
+      if (args.path !== deviceSignatureLoader) return undefined;
+      return {
+        loader: 'js',
+        contents: `let loaded = null;\nexport function loadDeviceSignature() {\n  if (!loaded) loaded = Promise.resolve().then(() => require(${JSON.stringify(RECORDS_CRYPTO_SUBPATH)}));\n  return loaded;\n}\n`,
+      };
+    });
+    b.onResolve({ filter: /^\.\/records-crypto\.js$/ }, () => ({ path: RECORDS_CRYPTO_SUBPATH, external: true }));
+  },
+};
+
 const cli = await build({
   ...common,
+  plugins: [loaderPlugin],
   entryPoints: [resolve(root, 'src/cli.ts')],
   outfile: resolve(root, 'dist/cli.js'),
   banner: { js: '#!/usr/bin/env node' },
 });
 const lib = await build({
   ...common,
+  plugins: [loaderPlugin],
   entryPoints: [resolve(root, 'src/index.ts')],
   outfile: resolve(root, 'dist/index.js'),
 });

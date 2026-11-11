@@ -733,6 +733,45 @@ async function checkDisclosure(
   };
 }
 
+/** What `checkCommittedEntries` found: the form on its own, its entries' batch roots, and a disclosure of some of them. */
+export interface CommittedEntriesOutcome {
+  formOk: boolean;
+  /** True when every entry's batch root is the proof layer's; false when one differs; null when not read (offline, or unreachable). */
+  rootsOk: boolean | null;
+  unreachable: boolean;
+  disclosure: DisclosureOutcome | null;
+  revealed: RevealedEntry[];
+}
+
+/**
+ * R7: a record PacSpace writes and keeps writing (a trail's index record, a link's reader record), as an evidence file
+ * holds it: the seal history's own form, every entry's batch root against the proof layer, and a disclosure of some
+ * entries against those roots. Its current word is not compared, since later entries move it on; each entry the file
+ * holds is checked to have been committed. Nothing is sent to PacSpace.
+ */
+export async function checkCommittedEntries(form: RecordSealHistoryV1, disclosure: RecordDisclosure | null, options: CheckOptions = {}): Promise<CommittedEntriesOutcome> {
+  const verification = verifyRecordSealHistoryV1(form, { layouts: getPublishedLayoutRegistry() });
+  const none: CommittedEntriesOutcome = { formOk: false, rootsOk: null, unreachable: false, disclosure: null, revealed: [] };
+  if (!verification.schemaOk || !verification.digestOk || !verification.verified) return none;
+  if (options.source === 'offline') return { ...none, formOk: true };
+  let reader: RecordChainReader;
+  try {
+    reader = readerFor(form.chain, options).reader;
+  } catch (error) {
+    if (error instanceof HistoryFileError) throw error;
+    return { ...none, formOk: true, unreachable: true };
+  }
+  const recorded = answeringReader(reader);
+  const { chainRoots, leftOut } = await readChainRootsV1(recorded.reader, form.entries.map((e) => String(e.batchId)));
+  if (leftOut.some((id) => !recorded.answered.has(id))) return { ...none, formOk: true, unreachable: true };
+  const rootsOk = form.entries.every((e) => sameHexRoot(chainRoots[String(e.batchId)], e.proofRoot));
+  const revealed: RevealedEntry[] = [];
+  const outcome = disclosure && rootsOk ? await checkDisclosure(form, disclosure, reader, (entries) => revealed.push(...entries)) : null;
+  return { formOk: true, rootsOk, unreachable: outcome?.kind === 'root-not-read', disclosure: outcome, revealed };
+}
+
+const sameHexRoot = (a: unknown, b: unknown) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+
 async function checkSeals(
   formName: HistorySchema,
   form: RecordSealHistoryV1,

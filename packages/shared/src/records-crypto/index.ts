@@ -54,6 +54,7 @@ export {
   recordsKeyFromBytesV1,
   wireRecordIdV1,
   wireReferenceIdV1,
+  blindedLabelV1,
   contentTagV1,
   contentTagV2,
   recordEntryPlaintextV1,

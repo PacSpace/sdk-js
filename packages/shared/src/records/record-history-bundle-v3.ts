@@ -420,12 +420,22 @@ export async function verifyRecordHistoryBundleV3(
   return { ok: true, opened, refused, verification: finishHistoryBundleV1(prepared, history) };
 }
 
-/** A copy of one record: its v3 history, which must carry its digest, and its record key. */
+/**
+ * A copy of one record: its v3 history, which must carry its digest, and its
+ * record key. The copy carries only what the history's digest covers: the
+ * status list beside the history (`entries`, `pendingEntries`, `nextFromSeq`)
+ * and each receipt's `status`, `code` and `sentence` are left out, so a
+ * change to any value in the file shows when the file is checked.
+ */
 export function buildRecordCopyV1(input: { recordKey: RecordKeyV1; history: RecordHistoryBundleV3 }): RecordCopyV1 {
   if (!(input.recordKey instanceof RecordKeyV1) || typeof input.history?.bundleDigest !== 'string') {
     throw new Error('RECORD_COPY_MALFORMED');
   }
-  return { schema: RECORD_COPY_SCHEMA_V1, recordKey: toBase64Url(exportKeyBytesV1(input.recordKey)), history: input.history };
+  const history = {
+    ...digestableHistoryBundleV1(input.history as unknown as RecordHistoryBundleV1),
+    bundleDigest: input.history.bundleDigest,
+  } as unknown as RecordHistoryBundleV3;
+  return { schema: RECORD_COPY_SCHEMA_V1, recordKey: toBase64Url(exportKeyBytesV1(input.recordKey)), history };
 }
 
 /** Reads a copy file's shape and its key. Never throws. */

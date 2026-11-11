@@ -61,3 +61,26 @@ export {
   type SeedWrapV1,
   type RecordsAsymmetricCodeV1,
 } from './records-asymmetric-v1';
+export {
+  makeDeviceKeysV1,
+  devicePublicV1,
+  wrapLinkKeyV1,
+  unwrapLinkKeyV1,
+  wrapAnswerKeyV1,
+  unwrapAnswerKeyV1,
+  wrapNoteKeyV1,
+  unwrapNoteKeyV1,
+  signApprovalV1,
+  signDeviceMessageV1,
+  verifyDeviceMessageV1,
+  type DeviceKeysV1,
+} from './reader-wraps-v1';
+export { sealAckFlagNotesV1, openAckFlagNoteV1, openAckNoteV1, type AckFlagNoteDeviceV1, type AckFlagNoteKeysV1 } from './ack-flag-notes-v1';
+export {
+  sealFlagNoteV1,
+  openFlagNoteV1,
+  sealFlagDraftsV1,
+  openFlagDraftsV1,
+  type FlagNoteDeviceV1,
+  type SealedFlagNoteV1,
+} from './flag-notes-v1';

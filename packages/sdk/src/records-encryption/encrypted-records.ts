@@ -1,7 +1,9 @@
 import {
   RECORD_HISTORY_BUNDLE_SCHEMA_V3,
+  RECORD_RESERVED_MESSAGE,
   admitRecordEntryV1,
   buildRecordCopyV1,
+  isReservedRecordForm,
   listPublishedLayouts,
   openReceiptV4,
   recordKeyFromBytesV1,
@@ -117,10 +119,10 @@ export class EncryptedRecords {
   /** A record's version, once known: `recordType \0 wireRecordId` to version. */
   private readonly versionOf = new Map<string, number>();
   /**
-   * The record hash version intake took last (card 10, F1): 2 until intake
-   * says it takes only 3. A refusal on one names the other, once.
+   * The record hash version intake took last (card 10, F1): 3 until intake
+   * says 3 is not turned on. A refusal on one names the other, once.
    */
-  private hashVersion: 2 | 3 = 2;
+  private hashVersion: 2 | 3 = 3;
   private workspaceId: string | null = null;
 
   constructor(
@@ -171,13 +173,26 @@ export class EncryptedRecords {
   }
 
   async emit(
-    input: { recordType: string; record: string; lifecycle: string; content: Record<string, unknown>; idempotencyKey?: string },
+    input: {
+      recordType: string;
+      record: string;
+      lifecycle: string;
+      content: Record<string, unknown>;
+      idempotencyKey?: string;
+      labels?: Array<[string, string]>;
+    },
     options?: RequestOptions,
   ): Promise<{ response: Record<string, unknown>; wireRecordId: string; wireReferenceId: string }> {
+    // Intake refuses the reserved forms by entity id, and a wire id never has one.
+    if (isReservedRecordForm(input.record)) throw new PacSpaceError(RECORD_RESERVED_MESSAGE, 409, 'RECORD_RESERVED');
     const { rc, ring } = await this.keys.ring();
     const { recordType, lifecycle, content } = input;
     this.admit(recordType, lifecycle, content);
     const wireRecordId = await rc.wireRecordIdV1(ring.idKey, recordType, input.record);
+    // D-23: each label blinded under the id key; PacSpace sees which records share one, never the label.
+    const labels = input.labels
+      ? [...new Set(await Promise.all(input.labels.map(([name, value]) => rc.blindedLabelV1(ring.idKey, name, value))))].sort()
+      : undefined;
     const saltKey = rc.newSaltKeyV2();
     const recordHashes = {
       2: (await rc.commitRecordContentV2(content, saltKey)).recordHash,
@@ -203,6 +218,7 @@ export class EncryptedRecords {
         recordHash: recordHashes[hashVersion],
         ...(hashVersion === 3 ? { recordHashVersion: 3 } : {}),
         contentTag,
+        ...(labels ? { labels } : {}),
         ...outside,
       };
       const size = rc.checkEncryptedWriteSizeV1(fields, recordsKey.id, plaintextBytes);
@@ -354,6 +370,32 @@ export class EncryptedRecords {
     return recordKeyFromBytesV1(rc.exportKeyBytesV1(recordKey), recordKey.recordsKeyId);
   }
 
+  /**
+   * Verifies a v3 history with its record's key: every envelope opened and
+   * checked against its record hash, then every seal, the chain between
+   * entries and the file's own digest, and the current word when `chainWord`
+   * is given. The verifier's refusal is returned, not thrown; finding the
+   * key can throw (no workspace secret, or a version it doesn't hold).
+   */
+  async verifyHistory(
+    body: RecordHistoryBundleV3,
+    read: RecordReadOptions,
+    verify: { expect?: { recordType: string; wireRecordId: string }; chainWord?: string } = {},
+    options?: RequestOptions,
+  ): Promise<{ result: Awaited<ReturnType<typeof verifyRecordHistoryBundleV3>>; recordKey: RecordKey; rc: RecordsCrypto }> {
+    const record = { recordType: body.recordType, wireRecordId: body.entityId };
+    const refused = (Array.isArray(body.refused) ? body.refused : []) as unknown as Array<{ envelope: Envelope } | null>;
+    const receipts = [...receiptsOf(body), ...refused.filter((r) => r !== null && typeof r === 'object').map((r) => ({ envelopes: [r!.envelope] }))];
+    const { rc, recordKey, others = [] } = await this.recordKeyFor(record, receipts, read, options);
+    const result = await verifyRecordHistoryBundleV3(body, {
+      recordKey: await this.forVerifier(rc, recordKey),
+      recordKeys: await Promise.all(others.map((k) => this.forVerifier(rc, k))),
+      ...(verify.expect ? { expect: verify.expect } : {}),
+      ...(verify.chainWord !== undefined ? { chainWord: verify.chainWord } : {}),
+    });
+    return { result, recordKey, rc };
+  }
+
   /** Opens a v3 history: every v4 receipt and refused envelope, each checked against its record hash. */
   async openHistory(
     body: RecordHistoryBundleV3,
@@ -364,13 +406,7 @@ export class EncryptedRecords {
     if (body.recordType !== record.recordType || body.entityId !== record.wireRecordId) {
       throw new RecordsEncryptionError('RECORDS_HISTORY_OTHER_RECORD');
     }
-    const receipts = [...receiptsOf(body), ...((body.refused ?? []) as unknown as Array<{ envelope: Envelope }>).map((r) => ({ envelopes: [r.envelope] }))];
-    const { rc, recordKey, others = [] } = await this.recordKeyFor(record, receipts, read, options);
-    const result = await verifyRecordHistoryBundleV3(body, {
-      recordKey: await this.forVerifier(rc, recordKey),
-      recordKeys: await Promise.all(others.map((k) => this.forVerifier(rc, k))),
-      expect: record,
-    });
+    const { result, recordKey, rc } = await this.verifyHistory(body, read, { expect: record }, options);
     if (!result.ok) throw readRefusal(result);
     const opened = result.opened
       .filter((e): e is Extract<typeof e, { content: Record<string, unknown> }> => 'content' in e)

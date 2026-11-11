@@ -13,6 +13,7 @@ import {
   RECORD_LINK_COPY_MAX_BYTES_V1,
   RECORD_LINK_COPY_SCHEMA_V1,
   RECORD_SEAL_HISTORY_SCHEMA_V1,
+  SHARED_RECORD_EVIDENCE_MAX_BYTES_V1,
   type HeldFile,
 } from '@pacspace/shared';
 import {
@@ -38,6 +39,9 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { checkRelease, DEFAULT_RELEASE_ORIGIN, releaseWords, type RawAnswer, type RawGet, type ReleaseAnchor } from './release';
 import { renderReport, TOO_LARGE_SENTENCE } from './report';
+import { checkEvidence, EvidenceFileError, readEvidenceFile, type EvidenceLine } from './evidence/evidence';
+import { EVIDENCE_WORDS } from './evidence/words';
+import { checkSamples } from './sample/sample';
 
 export interface CliArgs {
   file: string | null;
@@ -60,10 +64,16 @@ export const USAGE = `Usage: pacspace-check <history.json> [options]
        pacspace-check open [--link-file <path>] [--access-code-file <path>] [--copy <path>] [--html <path>] [--source <url> | --rpc <url>] [--timeout <ms>] [--json]
        pacspace-check release [--origin <url>] [--source <url> | --rpc <url>] [--timeout <ms>] [--json]
        pacspace-check release --origin <url> --release-record <record key>,<network id>,<contract>
+       pacspace-check evidence <evidence.json> [--offline | --source <url> | --rpc <url>] [--timeout <ms>] [--json]
+       pacspace-check sample <evidence.json> [--json]
 
 Checks a PacSpace record history file: every entry against what was
 committed, the file against its own fingerprint, and the record against
 the proof layer. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace.
+
+evidence checks an evidence record from a Shared Record link: its signature, and
+every record in it against the proof layer. sample re-derives each random
+request's picks from its seed.
 
 Options:
   --fingerprint <0x...>  the fingerprint printed on a statement; the checker
@@ -423,9 +433,88 @@ async function runRelease(argv: string[], io: CliIo): Promise<number> {
   return report.exitCode;
 }
 
+export interface EvidenceArgs {
+  file: string;
+  source: CheckOptions['source'];
+  timeoutMs: number | undefined;
+  json: boolean;
+}
+
+/** `evidence` takes the source options; `sample` reads the file alone. */
+export function parseEvidenceArgs(argv: string[], withSource: boolean): EvidenceArgs {
+  const args: Partial<EvidenceArgs> & { json: boolean } = { source: 'mirror', timeoutMs: undefined, json: false };
+  const takeValue = (flag: string, index: number): string => {
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith('--')) throw new UsageError(`${flag} needs a value.`);
+    return value;
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--json') args.json = true;
+    else if (withSource && arg === '--offline') args.source = 'offline';
+    else if (withSource && arg === '--source') args.source = takeValue(arg, index++);
+    else if (withSource && arg === '--rpc') args.source = { rpc: takeValue(arg, index++) };
+    else if (withSource && arg === '--timeout') {
+      const parsed = Number(takeValue(arg, index++));
+      if (!Number.isFinite(parsed) || parsed <= 0) throw new UsageError('--timeout needs a number of milliseconds.');
+      args.timeoutMs = parsed;
+    } else if (arg.startsWith('--')) throw new UsageError(`Unknown option ${arg}.`);
+    else if (args.file) throw new UsageError('Pass one evidence file.');
+    else args.file = arg;
+  }
+  if (!args.file) throw new UsageError('Pass one evidence file.');
+  return args as EvidenceArgs;
+}
+
+/** The report as text: the checker and its version first (D-42), then one line per check. */
+export function renderEvidenceLines(lines: EvidenceLine[]): string {
+  return `${[`${CHECKER_NAME} ${CHECKER_VERSION}`, ...lines.map((l) => l.sentence)].join('\n')}\n`;
+}
+
+async function readEvidence(io: CliIo, path: string) {
+  let bytes: Uint8Array;
+  try {
+    bytes = await io.readBytes(resolve(path), SHARED_RECORD_EVIDENCE_MAX_BYTES_V1 + 1);
+  } catch (error) {
+    throw new ExitTwo(`The file could not be read: ${(error as Error).message}`);
+  }
+  if (bytes.length > SHARED_RECORD_EVIDENCE_MAX_BYTES_V1) throw new ExitTwo(EVIDENCE_WORDS.tooLarge);
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    throw new ExitTwo(EVIDENCE_WORDS.notEvidence);
+  }
+  return readEvidenceFile(value);
+}
+
+async function runEvidenceCommand(command: 'evidence' | 'sample', argv: string[], io: CliIo): Promise<number> {
+  let args: EvidenceArgs;
+  try {
+    args = parseEvidenceArgs(argv, command === 'evidence');
+  } catch (error) {
+    io.stderr(`${(error as Error).message}\n\n${USAGE}`);
+    return 2;
+  }
+  try {
+    const file = await readEvidence(io, args.file);
+    const report = command === 'evidence' ? await checkEvidence(file, { source: args.source, timeoutMs: args.timeoutMs, fetchImpl: io.fetchImpl }) : await checkSamples(file);
+    io.stdout(args.json ? `${JSON.stringify(report, null, 2)}\n` : renderEvidenceLines(report.lines));
+    return report.exitCode;
+  } catch (error) {
+    if (error instanceof ExitTwo || error instanceof EvidenceFileError || error instanceof HistoryFileError) {
+      io.stderr(`${error.message}\n`);
+      return 2;
+    }
+    io.stderr(`The check could not run: ${(error as Error).message}\n`);
+    return 2;
+  }
+}
+
 /** Run the checker; returns the exit code. Reads and writes only through `io`. */
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   if (argv[0] === 'release') return runRelease(argv.slice(1), io);
+  if (argv[0] === 'evidence' || argv[0] === 'sample') return runEvidenceCommand(argv[0], argv.slice(1), io);
   if (argv[0] === 'open') return runOpen(argv.slice(1), io);
   let args: CliArgs;
   try {

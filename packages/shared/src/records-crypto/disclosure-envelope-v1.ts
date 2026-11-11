@@ -112,6 +112,13 @@ async function aesKey(key: Uint8Array, usage: 'encrypt' | 'decrypt'): Promise<Cr
   return subtle.importKey('raw', key as BufferSource, { name: 'AES-GCM' }, false, [usage]);
 }
 
+/** A key the caller already holds as a CryptoKey: AES-256-GCM, secret, usable to decrypt. Anything else opens nothing. */
+function isDecryptKey(key: unknown): key is CryptoKey {
+  if (typeof CryptoKey === 'undefined' || !(key instanceof CryptoKey) || key.type !== 'secret' || !key.usages.includes('decrypt')) return false;
+  const algorithm = key.algorithm as AesKeyAlgorithm;
+  return algorithm.name === 'AES-GCM' && algorithm.length === KEY_BYTES * 8;
+}
+
 /** The base64url envelope of a disclosure under a fresh IV. */
 export async function encryptDisclosureV1(input: { disclosure: RecordDisclosure; key: Uint8Array; handle: string }): Promise<string> {
   const { key, handle } = input;
@@ -131,10 +138,14 @@ export async function encryptDisclosureV1(input: { disclosure: RecordDisclosure;
   return toBase64Url(concatBytes(new Uint8Array([RECORD_DISCLOSURE_ENVELOPE_VERSION_V1]), iv, sealed));
 }
 
-/** Opens an envelope; the caller then runs verifyRecordDisclosureV1 on `disclosure`. Never throws. */
+/**
+ * Opens an envelope; the caller then runs verifyRecordDisclosureV1 on `disclosure`. Never throws. The key is the 32
+ * bytes, or a non-extractable AES-256-GCM CryptoKey with the decrypt usage that a browser keeps (plan conflict 2);
+ * any other key is refused as not opening.
+ */
 export async function decryptDisclosureV1(input: {
   envelope: string;
-  key: Uint8Array;
+  key: Uint8Array | CryptoKey;
   handle: string;
 }): Promise<{ ok: true; disclosure: unknown } | { ok: false; code: DisclosureEnvelopeRefusalV1; reason: string }> {
   try {
@@ -142,7 +153,8 @@ export async function decryptDisclosureV1(input: {
     if (!shape.ok) return refuse(shape.code);
     const bytes = fromBase64Url(input.envelope) as Uint8Array;
     const { key, handle } = input;
-    if (!(key instanceof Uint8Array) || key.length !== KEY_BYTES || typeof handle !== 'string') {
+    const held = isDecryptKey(key);
+    if ((!held && (!(key instanceof Uint8Array) || key.length !== KEY_BYTES)) || typeof handle !== 'string') {
       return refuse('DISCLOSURE_ENVELOPE_AUTH_FAILED');
     }
     let plain: Uint8Array;
@@ -151,7 +163,7 @@ export async function decryptDisclosureV1(input: {
       plain = new Uint8Array(
         await subtle.decrypt(
           { name: 'AES-GCM', iv: bytes.subarray(1, HEADER_BYTES) as BufferSource, additionalData: aadOf(handle) as BufferSource, tagLength: 128 },
-          await aesKey(key, 'decrypt'),
+          held ? key : await aesKey(key as Uint8Array, 'decrypt'),
           bytes.subarray(HEADER_BYTES) as BufferSource,
         ),
       );

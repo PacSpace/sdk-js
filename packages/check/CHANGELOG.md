@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Goes out as 0.6.0 with the export check (D-42); until then the checker reports its version as 0.5.0.
+
+### Added
+
+- `pacspace-check evidence <evidence.json> [--offline | --source <url> | --rpc <url>]` checks a Shared Record evidence file (`shared-record-evidence/v1`, Full or For reviewers): both of the reader device's signatures over the file's JCS, that the device is one the file lists as confirmed or since revoked, each acknowledgment against the digest the link's own record committed, and each record and answer against the proof layer. Exit 0 passes, 1 fails, 2 is a usage error, a file it cannot read, or a check that could not run, and 3 is a proof layer it cannot reach, which claims no match. `--offline` names what it did not check.
+- `pacspace-check sample <evidence.json>` re-derives each sample request's picks from its seed and pool and fails a changed pick or pool.
+
 ## 0.5.0 - 2026-10-16
 
 ### Changed

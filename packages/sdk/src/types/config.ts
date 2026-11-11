@@ -1,12 +1,10 @@
 import type { RecordsEncryptionOptions } from './records-encryption';
-import type { SubmissionAutomationOptions } from './submission';
-
 /**
  * PacSpace SDK configuration options.
  */
 export interface PacSpaceConfig {
   /**
-   * Your Balance API key.
+   * Your PacSpace API key.
    * Format: `pk_live_PUBLIC.SECRET` (production) or `pk_test_PUBLIC.SECRET` (sandbox).
    */
   apiKey: string;
@@ -17,7 +15,7 @@ export interface PacSpaceConfig {
   webhookSecret?: string;
 
   /**
-   * Base URL for the Balance API.
+   * Base URL for the PacSpace API.
    * If provided, this overrides the key-based choice.
    * If not provided, the SDK chooses by API key prefix:
    * - `pk_test_*` keys → `sandboxUrl` if set, else `https://app.pacspace.io`
@@ -102,11 +100,6 @@ export interface PacSpaceConfig {
    * @default 60000
    */
   bufferMaxDelayMs?: number;
-
-  /**
-   * Submission automation profile for tenant-produced usage summaries.
-   */
-  submission?: SubmissionAutomationOptions;
 
   /**
    * Encrypted records: the workspace secret (`secret` or `secretProvider`)

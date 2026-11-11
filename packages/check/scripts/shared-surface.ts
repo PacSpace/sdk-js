@@ -22,3 +22,13 @@ export { recordContentOfReceipt } from '../../shared/src/proof/semantic-receipt-
 export { decodeStateV1 } from '../../shared/src/proof/layout-document-v1';
 export { splitWordV1 } from '../../shared/src/proof/slot-encoding-v1';
 export type { LayoutRegistry } from '../../shared/src/proof/slot-encoding-v1';
+// R7: the evidence record and its acknowledgments, the device id and code a signature names, the seeded sample, and
+// the digest the index and reader records commit, and the two digests an acknowledgment names. A device's ML-DSA-65 signature is checked by dist/records-crypto.js,
+// loaded at run time (src/evidence/device-signature.ts).
+export * from '../../shared/src/records/shared-record-evidence-v1';
+export * from '../../shared/src/records/shared-record-ack-v2';
+export * from '../../shared/src/records/shared-record-ack-digests-v2';
+export { acknowledgmentKeyIdV2 } from '../../shared/src/records/signed-acknowledgment-v2';
+export { deviceCodeV1, deviceIdV1, drawSampleV1, samplePoolDigestV1 } from '../../shared/src/records/reader-crypto-v1';
+export { payloadDigestV1 } from '../../shared/src/records/trail-index-v1';
+export { canonicalizeJcs } from '../../shared/src/proof/jcs';

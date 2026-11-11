@@ -106,7 +106,7 @@ function withBody(error: PacSpaceError, parsed: ParsedApiError): PacSpaceError {
 }
 
 /**
- * Low-level HTTP client for the Balance API.
+ * Low-level HTTP client for the PacSpace API.
  * Handles authentication, response unwrapping, retries, and error mapping.
  *
  * @internal — Use the PacSpace class instead of this directly.
@@ -416,7 +416,7 @@ export class HttpClient {
     const headers: Record<string, string> = {
       'X-Api-Key': this.apiKey,
       'Content-Type': 'application/json',
-      'User-Agent': '@pacspace-io/sdk/0.14.0',
+      'User-Agent': '@pacspace-io/sdk/0.15.0',
     };
 
     if (options?.dashboardToken) {

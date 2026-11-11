@@ -7,4 +7,5 @@ export type {
   WebhookHeaders,
   DeltaVerifiedPayload,
   DeltaFailedPayload,
+  RecordClosedPayload,
 } from './types';

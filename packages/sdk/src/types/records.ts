@@ -41,6 +41,49 @@ export interface RecordEmitInput {
    * writes plaintext, for a record that was started in plaintext.
    */
   encrypt?: boolean;
+  /**
+   * Labels on the record, never in the entry's content and never committed.
+   * With a workspace secret set, each is blinded before it is sent.
+   */
+  labels?: RecordLabels;
+}
+
+/**
+ * Up to 10 `name=value` pairs: names of lowercase letters, digits, `_`, `.`
+ * and `-`, at most 32 characters; values of letters, digits and `._:/-`, at
+ * most 64. A string is read as the dashboard reads one: pairs split on `,`,
+ * `;` or a newline, each `name=value` or `name:value`, names lowercased.
+ */
+export type RecordLabels = Record<string, string> | string;
+
+export interface RecordCloseOptions {
+  recordType?: string;
+  /**
+   * The record's last entry, counted from 1. Left out, the SDK uses the last
+   * entry this process wrote to the record, or reads it from the record.
+   */
+  lastEntry?: EntryNumber;
+  /** With a workspace secret set, `false` closes a plaintext record by its own id. */
+  encrypted?: boolean;
+}
+
+export interface RecordCloseResponse {
+  recordType: string;
+  entityId: string;
+  recordKey: string;
+  closed: true;
+  closedBy: 'code';
+  closedAt: string;
+  /** The record's last entry, counted from 1. */
+  lastEntry: EntryNumber;
+  lastSeal: string | null;
+  /** True when this call repeated a close already made with the same last entry. */
+  idempotent: boolean;
+  /** Encrypted records: the record's own id, as passed. */
+  recordId?: string;
+  /** Encrypted records: the id PacSpace knows the record by. */
+  wireRecordId?: string;
+  encrypted?: boolean;
 }
 
 /**
@@ -86,6 +129,8 @@ export interface RecordEmitResponse {
   message?: string;
   code?: string;
   retryAfterSeconds?: number;
+  /** The number this entry will have in its record, counted from 1. */
+  entry?: EntryNumber;
   /** Encrypted writes: the record's own id, as passed. */
   recordId?: string;
   /** Encrypted writes: the id PacSpace knows the record by. A webhook names this one. */
@@ -183,7 +228,12 @@ export interface RecordCheckSource {
   address?: string;
 }
 
-export interface RecordCheckInput {
+/**
+ * An encrypted record's history is opened with the record's key before it is
+ * checked: the workspace secret's, or the one `grant` and `owner`, `recordKey`
+ * or `holderFor` name, as `records.history` took them.
+ */
+export interface RecordCheckInput extends Pick<RecordReadOptions, 'grant' | 'owner' | 'recordKey' | 'holderFor'> {
   history: RecordHistory;
   expect?: RecordCheckExpect[];
   source?: RecordCheckSource;
