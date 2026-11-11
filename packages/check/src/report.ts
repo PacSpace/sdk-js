@@ -362,6 +362,14 @@ function exitCodeOf(unreachable: boolean, failed: boolean): CheckReport['exitCod
   return failed ? 1 : 0;
 }
 
+/**
+ * Whether the boundary sentence closes the report. It says what a check that passed shows, so it is said
+ * only then: the check passed as asked, and no daily statement in the report differs from the proof layer.
+ */
+function closesWithBoundary(exitCode: CheckReport['exitCode'], dailyStatement: DailyStatementOutcome | null): boolean {
+  return exitCode === 0 && dailyStatement?.matches !== false;
+}
+
 function statementFingerprintOf(given: string | null, intact: boolean, fingerprint: string | null) {
   return given ? { given, matches: intact && sameHex(given, fingerprint) } : null;
 }
@@ -407,11 +415,12 @@ export function buildReport(input: ReportInput): CheckReport {
   const fingerprintLine = fingerprintSentence(intact, statementFingerprint);
   if (fingerprintLine) sentences.push(fingerprintLine);
   if (input.heldFile) sentences.push(...heldFileSentences(input.heldFile));
-  sentences.push(HONESTY_SENTENCE);
 
   const failed =
     !passed || (statementFingerprint !== null && !statementFingerprint.matches) || (!!input.heldFile && !input.heldFile.matched);
   const unreachable = !input.source.compared && input.source.reason === 'unreachable';
+  const exitCode = exitCodeOf(unreachable, failed);
+  if (closesWithBoundary(exitCode, input.dailyStatement)) sentences.push(HONESTY_SENTENCE);
 
   return {
     schema: REPORT_SCHEMA,
@@ -426,7 +435,7 @@ export function buildReport(input: ReportInput): CheckReport {
     ...(input.heldFile ? { heldFile: heldFileField(input.heldFile) } : {}),
     reason: input.verification.reason,
     sentences,
-    exitCode: exitCodeOf(unreachable, failed),
+    exitCode,
   };
 }
 
@@ -479,12 +488,13 @@ export function buildSealsReport(input: SealsReportInput): CheckReport {
   const fingerprintLine = fingerprintSentence(intact, statementFingerprint);
   if (fingerprintLine) sentences.push(fingerprintLine);
   if (input.heldFile && disclosure?.kind === 'verified') sentences.push(...heldFileSentences(input.heldFile));
-  sentences.push(SEALS_BOUNDARY_SENTENCE);
 
   const failed =
     !passed || (statementFingerprint !== null && !statementFingerprint.matches) || (!!input.heldFile && !input.heldFile.matched);
   const unreachable =
     (!input.source.compared && input.source.reason === 'unreachable') || disclosure?.kind === 'root-not-read';
+  const exitCode = exitCodeOf(unreachable, failed);
+  if (closesWithBoundary(exitCode, null)) sentences.push(SEALS_BOUNDARY_SENTENCE);
 
   return {
     schema: REPORT_SCHEMA,
@@ -500,7 +510,7 @@ export function buildSealsReport(input: SealsReportInput): CheckReport {
     ...(input.heldFile ? { heldFile: heldFileField(input.heldFile) } : {}),
     reason: v.reason,
     sentences,
-    exitCode: exitCodeOf(unreachable, failed),
+    exitCode,
   };
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@pacspace-io/check",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Checks a PacSpace record history file against the proof layer. Runs without PacSpace.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

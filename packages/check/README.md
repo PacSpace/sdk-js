@@ -56,9 +56,10 @@ The check shows the record is unchanged since it was committed. It does not show
    file alone proves it; otherwise `--full` reads every daily statement the
    proof layer carries and compares.
 
-The last sentence is always the same, because it is the boundary of the
-check: the check shows the record is unchanged since it was committed; it
-does not show that what was recorded was true.
+When the check passes, the last sentence is the boundary of the check:
+the check shows the record is unchanged since it was committed; it does
+not show that what was recorded was true. When the check does not pass,
+that sentence is not printed.
 
 A seal history, saved from a Shared Record link, and a kept copy from its Keep a copy, are checked the same way. The check confirms the seals, their order and that all of them are here, and each revealed field against its entry's seal; --held-file checks a file against the fingerprints among the revealed fields.
 

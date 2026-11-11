@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 - 2026-11-11
+
+### Changed
+
+- The closing sentence is printed only when the check passes. Before, it was printed after a failed check too.
+
 ## 0.5.0 - 2026-10-16
 
 ### Changed
