@@ -325,8 +325,18 @@ export function sourceSentence(source: SourceOutcome): string {
     : `Compared with the proof layer for this record: it does not match.${source.detail ? ` ${source.detail}` : ''}`;
 }
 
-export function dailyStatementSentence(statement: DailyStatementOutcome | null): string {
+/** What a changed file's daily statement gets: nothing in a changed file is compared, and `--full` would not change that. */
+const DAILY_STATEMENT_NOT_COMPARED_CHANGED_SENTENCE =
+  'The daily statement this file carries was not compared, because this file was changed.';
+
+/**
+ * The report's line on the daily statement. `changed` is true when the file no longer produces the
+ * fingerprint it carries: its statement is named as carried and not compared, without its date,
+ * which is then a value from a changed file.
+ */
+export function dailyStatementSentence(statement: DailyStatementOutcome | null, changed = false): string {
   if (!statement) return 'This file carries no daily statement.';
+  if (changed) return DAILY_STATEMENT_NOT_COMPARED_CHANGED_SENTENCE;
   const day = `Daily statement of ${dayOfUtc(statement.date)} (UTC)`;
   if (statement.matches === null) {
     return `${day}: not compared from this file alone. Pass --full to compare it with the proof layer.`;
@@ -364,10 +374,10 @@ function exitCodeOf(unreachable: boolean, failed: boolean): CheckReport['exitCod
 
 /**
  * Whether the boundary sentence closes the report. It says what a check that passed shows, so it is said
- * only then: the check passed as asked, and no daily statement in the report differs from the proof layer.
+ * only when the check passed as asked.
  */
-function closesWithBoundary(exitCode: CheckReport['exitCode'], dailyStatement: DailyStatementOutcome | null): boolean {
-  return exitCode === 0 && dailyStatement?.matches !== false;
+function closesWithBoundary(exitCode: CheckReport['exitCode']): boolean {
+  return exitCode === 0;
 }
 
 function statementFingerprintOf(given: string | null, intact: boolean, fingerprint: string | null) {
@@ -411,16 +421,20 @@ export function buildReport(input: ReportInput): CheckReport {
     sentences.push(input.verification.reason);
   }
   sentences.push(sourceSentence(input.source));
-  sentences.push(dailyStatementSentence(input.dailyStatement));
+  sentences.push(dailyStatementSentence(input.dailyStatement, !intact));
   const fingerprintLine = fingerprintSentence(intact, statementFingerprint);
   if (fingerprintLine) sentences.push(fingerprintLine);
   if (input.heldFile) sentences.push(...heldFileSentences(input.heldFile));
 
+  // Only --full, which reads the proof layer's daily statements, can find that the file's statement does not match. Then the check as asked did not pass.
   const failed =
-    !passed || (statementFingerprint !== null && !statementFingerprint.matches) || (!!input.heldFile && !input.heldFile.matched);
+    !passed ||
+    input.dailyStatement?.matches === false ||
+    (statementFingerprint !== null && !statementFingerprint.matches) ||
+    (!!input.heldFile && !input.heldFile.matched);
   const unreachable = !input.source.compared && input.source.reason === 'unreachable';
   const exitCode = exitCodeOf(unreachable, failed);
-  if (closesWithBoundary(exitCode, input.dailyStatement)) sentences.push(HONESTY_SENTENCE);
+  if (closesWithBoundary(exitCode)) sentences.push(HONESTY_SENTENCE);
 
   return {
     schema: REPORT_SCHEMA,
@@ -494,7 +508,7 @@ export function buildSealsReport(input: SealsReportInput): CheckReport {
   const unreachable =
     (!input.source.compared && input.source.reason === 'unreachable') || disclosure?.kind === 'root-not-read';
   const exitCode = exitCodeOf(unreachable, failed);
-  if (closesWithBoundary(exitCode, null)) sentences.push(SEALS_BOUNDARY_SENTENCE);
+  if (closesWithBoundary(exitCode)) sentences.push(SEALS_BOUNDARY_SENTENCE);
 
   return {
     schema: REPORT_SCHEMA,

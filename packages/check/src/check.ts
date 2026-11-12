@@ -78,6 +78,12 @@ export type HistorySchema = (typeof HISTORY_SCHEMAS)[number];
 /** W-L2g-27, W-C10-B-21 */
 export const NOT_A_HISTORY_SENTENCE =
   'This file is not a record history. A history file names its form as record-history-bundle/v1, record-history-bundle/v2, record-history-bundle/v3, pacspace-record-copy/v1, record-seal-history/v1, record-link-copy/v1, record-disclosure/v1 or record-disclosure/v2.';
+/**
+ * A file whose text is not JSON. It may never have been a history, or it may be one that an edit
+ * left unreadable (a deleted quote, `True` for `true`), so the sentence does not say which.
+ */
+const NOT_READ_AS_JSON_SENTENCE =
+  'This file could not be read as JSON, so it could not be checked. Either it is not a record history, or it has been changed since it was exported.';
 /** W-C10-B-5: an encrypted record from before format 2 (card 10). */
 export const EARLIER_ENCRYPTED_FORMAT_SENTENCE = 'This record uses an earlier encrypted format that this checker no longer accepts.';
 /** W-L2g-1 */
@@ -165,7 +171,7 @@ export function parseHistoryFile(text: string): HistoryFile {
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new HistoryFileError('This file is not a record history. It could not be read as JSON.');
+    throw new HistoryFileError(NOT_READ_AS_JSON_SENTENCE);
   }
   const schema = parsed && typeof parsed === 'object' ? (parsed as { schema?: unknown }).schema : undefined;
   if (!(HISTORY_SCHEMAS as readonly unknown[]).includes(schema)) throw new HistoryFileError(NOT_A_HISTORY_SENTENCE);
@@ -560,7 +566,7 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
         ...base,
         verification: { verified: false, digestOk: false, reason: '', history: null },
         source: { compared: false, reason: 'offline' },
-        dailyStatement: null,
+        dailyStatement: dailyStatementOf(asFile, false),
       });
     }
     const sentence = encryptedRefusalSentence(refusal);

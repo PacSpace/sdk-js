@@ -54,7 +54,8 @@ The check shows the record is unchanged since it was committed. It does not show
 5. The daily statement. A history file carries the daily statement that
    covered it at export. When that statement is still the current one the
    file alone proves it; otherwise `--full` reads every daily statement the
-   proof layer carries and compares.
+   proof layer carries and compares. A daily statement that does not match
+   fails the check.
 
 When the check passes, the last sentence is the boundary of the check:
 the check shows the record is unchanged since it was committed; it does

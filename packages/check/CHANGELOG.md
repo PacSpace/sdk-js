@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2 - 2026-11-12
+
+### Changed
+
+- A file that cannot be read as JSON is no longer called "not a record history". The report says it could not be read, so it could not be checked. The exit code is still 2.
+- After a changed file, the report no longer says the file carries no daily statement when it carries one. It says the daily statement was not compared.
+- With --full, a daily statement that does not match the proof layer fails the check (exit code 1). Before, the report said so and the exit code stayed 0.
+
 ## 0.5.1 - 2026-11-11
 
 ### Changed
