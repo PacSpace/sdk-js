@@ -1,0 +1,12 @@
+{
+  "name": "@pacspace/shared",
+  "version": "1.0.0",
+  "private": true,
+  "types": "dist/mirror-surface.d.ts",
+  "dependencies": {
+    "@noble/post-quantum": "0.7.1",
+    "@panva/hpke-noble": "1.1.7",
+    "ethers": "6.17.0",
+    "hpke": "1.1.7"
+  }
+}
