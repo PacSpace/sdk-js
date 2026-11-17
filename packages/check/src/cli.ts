@@ -53,6 +53,8 @@ export interface CliArgs {
   history: string | null;
   /** A path, or `-` for stdin; never the key itself. */
   key: string | null;
+  /** `--no-lookup`: do not look up where each entry was committed. */
+  noLookup: boolean;
 }
 
 export const USAGE = `Usage: pacspace-check <history.json> [options]
@@ -81,6 +83,7 @@ Options:
                          the one known for the record's network
   --rpc <url>            read the proof layer over JSON-RPC at this URL
   --full                 also read every daily statement
+  --no-lookup            do not look up where each entry was committed
   --timeout <ms>         network timeout per read (default 10000)
   --json                 print the report as JSON
   --version              print the checker's version
@@ -107,6 +110,7 @@ export function parseArgs(argv: string[]): CliArgs {
     blinding: null,
     history: null,
     key: null,
+    noLookup: false,
   };
   const takeValue = (flag: string, index: number): string => {
     const value = argv[index + 1];
@@ -131,6 +135,9 @@ export function parseArgs(argv: string[]): CliArgs {
         break;
       case '--full':
         args.full = true;
+        break;
+      case '--no-lookup':
+        args.noLookup = true;
         break;
       case '--fingerprint':
         args.statementFingerprint = takeValue(arg, index);
@@ -477,8 +484,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         history,
         heldFile,
         recordKey,
+        // Where each entry was committed: asked only here, for a check that reads the proof layer.
+        writes: args.source !== 'offline' && !args.noLookup,
       });
-      io.stdout(args.json ? `${JSON.stringify(report, null, 2)}\n` : renderReport(report));
+      // --full on a mirror reads the record's whole history, so an entry not found then is not helped by it.
+      const suggestFull = !(args.full && typeof args.source === 'string');
+      io.stdout(args.json ? `${JSON.stringify(report, null, 2)}\n` : renderReport(report, { suggestFull }));
       return report.exitCode;
     } finally {
       recordKey?.fill(0);

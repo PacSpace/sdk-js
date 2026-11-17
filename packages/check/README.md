@@ -34,10 +34,24 @@ Proof layer                  <the proof layer mirror the record names>
 
 This record has 3 entries. All 3 are here, and all 3 match what was committed.
 Compared with the proof layer for this record: it matches.
+Where each entry was committed on the proof layer:
+Entry 1: committed 11 September 2026, 23:58:07 UTC
+  https://hashscan.io/mainnet/transaction/0x5d1c...9a3e
+Entries 2 and 3: committed 12 September 2026, 00:41:19 UTC
+  https://hashscan.io/mainnet/transaction/0x81f0...c27b
 Daily statement of 12 September 2026 (UTC): matches.
 The fingerprint you gave names this file.
 The check shows the record is unchanged since it was committed. It does not show that what was recorded was true.
 ```
+
+After a history file passes and matches the proof layer, the report lists
+where each entry was committed: the time, and a link to the write. The
+link opens that write on an explorer of the proof layer, which shows the
+same time in your own time zone. `--json` carries the same in a `writes`
+field. This is information only: when it cannot be read the report says
+so, and the result and the exit code are what they were. `--no-lookup`
+leaves it out, `--offline` never makes it, and `release` and `open` do
+not make it.
 
 ## What it checks
 
@@ -95,6 +109,7 @@ release reads each file three ways, as the host sends it, and checks each answer
 --source <url>         read the proof layer from this mirror
 --rpc <url>            read the proof layer over JSON-RPC at this URL
 --full                 also read every daily statement
+--no-lookup            do not look up where each entry was committed
 --timeout <ms>         network timeout per read (default 10000)
 --json                 print the report as JSON
 ```

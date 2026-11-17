@@ -58,6 +58,31 @@ export type DisclosureOutcome =
       payloads: Array<{ seq: number; items: unknown[] }>;
     };
 
+/** Where one or more entries were committed: one write on the proof layer. */
+export interface EntryWrite {
+  /** Entry numbers (1-based) committed together. */
+  entries: number[];
+  /** When the proof layer committed them, ISO 8601 (UTC). */
+  committedAt: string;
+  transactionHash: string;
+  blockNumber: number | null;
+  /** The write on an explorer of the proof layer; null when the checker has none for the source it read. */
+  link: string | null;
+}
+
+/**
+ * Where each entry was committed, looked up after the check had its verdict. Information only: it is
+ * never read by the verdict, the sentences or the exit code.
+ */
+export type WritesOutcome =
+  | {
+      read: true;
+      entries: EntryWrite[];
+      /** Entry numbers (1-based) whose write this read of the proof layer did not find. */
+      notFound: number[];
+    }
+  | { read: false; reason: 'unreachable' | 'timeout' };
+
 export interface CheckReport {
   schema: typeof REPORT_SCHEMA;
   checker: { name: string; version: string };
@@ -94,6 +119,8 @@ export interface CheckReport {
   sentences: string[];
   /** 0 the check passed as asked; 1 it did not; 3 the proof layer could not be reached. */
   exitCode: 0 | 1 | 3;
+  /** Present only when the lookup ran: where each entry was committed. */
+  writes?: WritesOutcome;
 }
 
 /** The subset of the shared verifier's result the report reads. */
@@ -528,8 +555,63 @@ export function buildSealsReport(input: SealsReportInput): CheckReport {
   };
 }
 
-/** The report as the terminal prints it: labeled facts in a column, then the sentences. */
-export function renderReport(report: CheckReport): string {
+export const WRITES_HEADING = 'Where each entry was committed on the proof layer:';
+export const WRITES_NOT_READ_SENTENCE =
+  'Where each entry was committed could not be read from the proof layer this time. The check above does not depend on it.';
+/** The text report lists at most this many writes; `--json` lists all. */
+export const WRITES_LISTED_MAX = 25;
+
+/** "Entry 4", "Entries 2 and 3", "Entries 2, 5 and 9", or "Entries 2 to 31" for three or more in a row. */
+function entriesLabel(numbers: number[]): string {
+  const sorted = [...numbers].sort((a, b) => a - b);
+  const inARow = sorted.every((n, i) => i === 0 || n === sorted[i - 1] + 1);
+  if (sorted.length >= 3 && inARow) return `Entries ${sorted[0]} to ${sorted[sorted.length - 1]}`;
+  return listEntries(sorted);
+}
+
+/** "16 November 2026, 13:15:42 UTC" for an ISO instant. */
+export function committedWhen(iso: string): string {
+  return `${dayOfUtc(iso)}, ${iso.slice(11, 19)} UTC`;
+}
+
+export function writesNotFoundSentence(notFound: number[], suggestFull: boolean): string {
+  const one = notFound.length === 1;
+  return [
+    `${entriesLabel(notFound)}: where ${one ? 'it was' : 'they were'} committed was not found in this read of the proof layer.`,
+    ...(suggestFull ? ["--full reads the record's whole history."] : []),
+    'The check above does not depend on it.',
+  ].join(' ');
+}
+
+export function writesNotListedSentence(count: number): string {
+  return `${count} more ${entryWord(count)} ${isAre(count)} not listed here. --json lists them all.`;
+}
+
+/**
+ * The lines that say where each entry was committed, or none when the lookup did not run or found
+ * nothing to say. `suggestFull` is false when the run already read the record's whole history.
+ */
+export function writesLines(writes: WritesOutcome | undefined, suggestFull = true): string[] {
+  if (!writes) return [];
+  if (!writes.read) return [WRITES_NOT_READ_SENTENCE];
+  if (writes.entries.length === 0 && writes.notFound.length === 0) return [];
+  const lines = [WRITES_HEADING];
+  for (const write of writes.entries.slice(0, WRITES_LISTED_MAX)) {
+    const line = `${entriesLabel(write.entries)}: committed ${committedWhen(write.committedAt)}`;
+    if (write.link) lines.push(line, `  ${write.link}`);
+    else lines.push(`${line}, write ${write.transactionHash}`);
+  }
+  const unlisted = writes.entries.slice(WRITES_LISTED_MAX).reduce((sum, write) => sum + write.entries.length, 0);
+  if (unlisted > 0) lines.push(writesNotListedSentence(unlisted));
+  if (writes.notFound.length > 0) lines.push(writesNotFoundSentence(writes.notFound, suggestFull));
+  return lines;
+}
+
+/**
+ * The report as the terminal prints it: labeled facts in a column, then the sentences. Where each
+ * entry was committed, when it was looked up, follows the line that compares the file with the proof layer.
+ */
+export function renderReport(report: CheckReport, options: { suggestFull?: boolean } = {}): string {
   const facts: Array<[string, string]> = [
     ['Reference', report.record.reference],
     ['Fingerprint of this history', report.file.fingerprint ?? 'none'],
@@ -539,6 +621,9 @@ export function renderReport(report: CheckReport): string {
   const width = Math.max(...facts.map(([label]) => label.length));
   const lines = facts.map(([label, value]) => `${label.padEnd(width)}  ${value}`);
   lines.push('');
-  lines.push(...report.sentences);
+  const where = writesLines(report.writes, options.suggestFull ?? true);
+  const after = where.length ? report.sentences.indexOf(sourceSentence(report.source)) : -1;
+  if (after >= 0) lines.push(...report.sentences.slice(0, after + 1), ...where, ...report.sentences.slice(after + 1));
+  else lines.push(...report.sentences, ...where);
   return `${lines.join('\n')}\n`;
 }

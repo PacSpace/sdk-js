@@ -2,6 +2,7 @@ import { ethers } from 'ethers';
 import { normalizeProofHash } from '../proof/merkle-v2';
 import { hex256 } from '../proof/slot-encoding-v1';
 import { MIRROR_NODE_BY_CHAIN } from '../records/inspect-record-calldata-v1';
+import { ledgerWriteSearchPath, nextLedgerWritePath, parseLedgerWriteLog } from '../records/ledger-write-search-v1';
 import {
   LEDGER_HEAD_ADVANCED_TOPIC,
   RECORD_LANE_ABI_V38,
@@ -10,6 +11,7 @@ import {
   type OnChainLayout,
   type RecordChainReader,
   type RecordWrite,
+  type RecordWriteSearchResult,
 } from './independent-verify-records';
 
 /**
@@ -34,6 +36,24 @@ export interface MirrorNodeReaderOptions {
   fetchImpl?: typeof fetch;
   /** Retries on 429 and 5xx (each with a short linear backoff). */
   attempts?: number;
+  /**
+   * Keep the contract's log pages once read, for this reader's life, so a second question of the same
+   * history asks nothing more. Only for a reader made for one run.
+   */
+  keepLogPages?: boolean;
+}
+
+/** Six days: a day inside the mirror's rule that a topic search span less than seven. */
+export const RECORD_WRITE_SEARCH_WINDOW_SECONDS = 6 * 24 * 60 * 60;
+const DAY_SECONDS = 24 * 60 * 60;
+/** A consensus timestamp as the mirror sends it: seconds, a dot, nine digits. */
+const CONSENSUS_TIMESTAMP = /^\d{1,12}\.\d{9}$/;
+
+/** `1794856672.526106228` as an ISO instant to the millisecond, or undefined when it is not a consensus timestamp. */
+function committedAtOf(timestamp: unknown): string | undefined {
+  if (typeof timestamp !== 'string' || !CONSENSUS_TIMESTAMP.test(timestamp)) return undefined;
+  const [seconds, fraction] = timestamp.split('.');
+  return new Date(Number(seconds) * 1000 + Number(fraction.slice(0, 3))).toISOString();
 }
 
 interface MirrorLog {
@@ -108,7 +128,21 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
     return topics.every((topic, index) => !topic || (log.topics[index] ?? '').toLowerCase() === topic.toLowerCase());
   }
 
-  async function scanLogs(topics: Array<string | null>, fromBlock: number, toBlock: number | 'latest'): Promise<MirrorLog[]> {
+  let keptLogs: Promise<MirrorLog[]> | null = null;
+
+  /** Every log of the contract, unfiltered, in the mirror's ascending order. */
+  function readAllLogs(): Promise<MirrorLog[]> {
+    if (!options.keepLogPages) return readAllLogPages();
+    if (!keptLogs) {
+      keptLogs = readAllLogPages();
+      keptLogs.catch(() => {
+        keptLogs = null;
+      });
+    }
+    return keptLogs;
+  }
+
+  async function readAllLogPages(): Promise<MirrorLog[]> {
     const params = new URLSearchParams();
     params.set('order', 'asc');
     params.set('limit', String(pageSize));
@@ -124,18 +158,40 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
     let pages = 0;
     while (next) {
       const page = (await request(next)) as MirrorLogsPage;
-      for (const log of page.logs ?? []) {
-        if (!matchesTopics(log, topics)) continue;
-        if (log.block_number < fromBlock) continue;
-        if (toBlock !== 'latest' && log.block_number > toBlock) continue;
-        out.push(log);
-      }
+      out.push(...(page.logs ?? []));
       next = page.links?.next ?? null;
       pages += 1;
       if (pages > 10_000) throw new Error('mirror node log scan exceeded 10,000 pages');
     }
+    return out;
+  }
+
+  async function scanLogs(topics: Array<string | null>, fromBlock: number, toBlock: number | 'latest'): Promise<MirrorLog[]> {
+    const out: MirrorLog[] = [];
+    for (const log of await readAllLogs()) {
+      if (!matchesTopics(log, topics)) continue;
+      if (log.block_number < fromBlock) continue;
+      if (toBlock !== 'latest' && log.block_number > toBlock) continue;
+      out.push(log);
+    }
     out.sort((a, b) => a.block_number - b.block_number || a.index - b.index);
     return out;
+  }
+
+  /** One page of a write search: one attempt, no redirect followed, cut off after `ms`. */
+  async function searchPage(path: string, ms: number): Promise<MirrorLogsPage | 'timeout'> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+      const response = await fetchImpl(`${base}${path}`, { headers: { accept: 'application/json' }, redirect: 'error', signal: controller.signal });
+      if (!response.ok) throw new Error(`mirror node ${response.status} for a record's writes`);
+      return (await response.json()) as MirrorLogsPage;
+    } catch (error) {
+      if (controller.signal.aborted) return 'timeout';
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   return {
@@ -196,9 +252,56 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
           blockNumber: log.block_number,
           transactionHash: log.transaction_hash,
           logIndex: log.index,
+          committedAt: committedAtOf(log.timestamp),
+          contractAddress: typeof log.address === 'string' ? log.address.toLowerCase() : undefined,
         });
       }
       return out;
+    },
+    async findRecordWrites(recordKey, search) {
+      const key = normalizeProofHash(recordKey, 'recordKey').toLowerCase();
+      const topic0 = RECORD_WRITTEN_TOPIC.toLowerCase();
+      const now = search.now ?? Date.now;
+      const deadline = now() + search.budgetMs;
+      const windowSeconds = Math.max(1, Math.floor(search.windowSeconds ?? RECORD_WRITE_SEARCH_WINDOW_SECONDS));
+      const nowSeconds = Math.floor(now() / 1000);
+      const hint = search.startAt ? Date.parse(search.startAt) : Number.NaN;
+      let upper = Math.min(Number.isFinite(hint) ? Math.floor(hint / 1000) : nowSeconds, nowSeconds) + DAY_SECONDS;
+      const writes: RecordWrite[] = [];
+      let requests = 0;
+      const end = (ended: RecordWriteSearchResult['ended']): RecordWriteSearchResult => ({ writes, ended, requests });
+      while (!search.done(writes)) {
+        if (upper <= 0) return end('limit');
+        const lower = Math.max(0, upper - windowSeconds);
+        let path: string | null = ledgerWriteSearchPath({ contractAddress, topic0, recordKey: key, lower, upper });
+        while (path) {
+          const left = deadline - now();
+          if (requests >= search.maxRequests || left <= 0) return end('limit');
+          requests += 1;
+          const page = await searchPage(path, left);
+          if (page === 'timeout') return end('timeout');
+          for (const log of Array.isArray(page.logs) ? page.logs : []) {
+            const write = parseLedgerWriteLog(log, { topic0, recordKey: key });
+            // The stricter time pattern: a value this reader prints is the mirror's consensus timestamp or nothing.
+            if (!write || write.address !== contractAddress || !CONSENSUS_TIMESTAMP.test(write.timestamp)) continue;
+            writes.push({
+              previousWord: write.previousWord,
+              newWord: write.newWord,
+              operator: write.operator,
+              encodingVersion: write.encodingVersion,
+              blockNumber: write.blockNumber ?? undefined,
+              transactionHash: write.transactionHash,
+              logIndex: write.logIndex ?? undefined,
+              committedAt: write.committedAt,
+              contractAddress: write.address,
+            });
+          }
+          if (search.done(writes)) return end('done');
+          path = nextLedgerWritePath(page.links?.next);
+        }
+        upper = lower;
+      }
+      return end('done');
     },
   };
 }

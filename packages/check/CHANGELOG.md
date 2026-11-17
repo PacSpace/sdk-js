@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.4 - 2026-11-16
+
+### Added
+
+- After a history file passes and matches the proof layer, the report lists where each entry was committed: the time, and a link to the write on an explorer of the proof layer. `--json` carries the same in a new `writes` field. This is information only: when it cannot be read the report says so, and the result and the exit code are what they were. `--no-lookup` leaves it out, `--offline` never makes it, and `release` and `open` do not make it.
+
 ## 0.5.3 - 2026-11-15
 
 ### Changed
