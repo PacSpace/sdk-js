@@ -33,10 +33,12 @@ import {
   verifyRecordHistoryBundle,
   verifyRecordHistoryBundleV3,
   verifyRecordSealHistoryV1,
+  mirrorRefusalOf,
   type BundleVerificationV1,
   type EncryptedReadRefusalV1,
   type HeldFile,
   type LayoutRegistry,
+  type MirrorRefusalCode,
   type RecordChainReader,
   type RecordDisclosure,
   type RecordHistoryBundleV1,
@@ -563,7 +565,7 @@ async function checkBundle(file: HistoryFile, options: CheckOptions): Promise<Ch
     };
   } catch (error) {
     if (error instanceof HistoryFileError) throw error;
-    source = { compared: false, reason: 'unreachable', detail: (error as Error).message };
+    source = notReached(error);
   }
 
   const report = buildReport({
@@ -705,7 +707,7 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
     };
   } catch (error) {
     if (error instanceof HistoryFileError) throw error;
-    source = { compared: false, reason: 'unreachable', detail: (error as Error).message };
+    source = notReached(error);
   }
 
   const report = buildReport({
@@ -743,19 +745,33 @@ function ledgerAgrees(form: RecordSealHistoryV1, material: { genesisHead: string
 }
 
 /** A reader that records which batch ids the source answered at all, so a refused root is told from an unread one. */
-function answeringReader(reader: RecordChainReader): { reader: RecordChainReader; answered: Set<string> } {
+function answeringReader(reader: RecordChainReader): { reader: RecordChainReader; answered: Set<string>; refused: () => MirrorRefusalCode | undefined } {
   const answered = new Set<string>();
+  let refused: MirrorRefusalCode | undefined;
   return {
     answered,
+    // The first refusal of the source's answer, when a root was not read for that and not for want of an answer.
+    refused: () => refused,
     reader: {
       ...reader,
       getBatchRoot: async (batchId) => {
-        const root = await reader.getBatchRoot(batchId);
-        answered.add(String(batchId));
-        return root;
+        try {
+          const root = await reader.getBatchRoot(batchId);
+          answered.add(String(batchId));
+          return root;
+        } catch (error) {
+          refused ??= mirrorRefusalOf(error) ?? undefined;
+          throw error;
+        }
       },
     },
   };
+}
+
+/** A source that was not read: one that could not be reached, or, with `refused`, one whose answer the reader refused. */
+function notReached(error: unknown): SourceOutcome {
+  const refused = mirrorRefusalOf(error);
+  return { compared: false, reason: 'unreachable', detail: (error as Error).message, ...(refused ? { refused } : {}) };
 }
 
 /** A JSON Pointer token for an object member's name. */
@@ -868,7 +884,7 @@ async function checkSeals(
     };
   } catch (error) {
     if (error instanceof HistoryFileError) throw error;
-    source = { compared: false, reason: 'unreachable', detail: (error as Error).message };
+    source = notReached(error);
     reader = null;
   }
 

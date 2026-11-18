@@ -2,7 +2,20 @@ import { ethers } from 'ethers';
 import { normalizeProofHash } from '../proof/merkle-v2';
 import { hex256 } from '../proof/slot-encoding-v1';
 import { MIRROR_NODE_BY_CHAIN } from '../records/inspect-record-calldata-v1';
-import { ledgerWriteSearchPath, nextLedgerWritePath, parseLedgerWriteLog } from '../records/ledger-write-search-v1';
+import {
+  contractLogPath,
+  isMirrorRedirect,
+  LEDGER_WRITE_SEARCH_PAGE_LIMIT,
+  ledgerWriteSearchPath,
+  MIRROR_ANSWER_MAX_BYTES,
+  mirrorRefusal,
+  mirrorRefusalOf,
+  nextLogPath,
+  parseLedgerWriteLog,
+  readMirrorJson,
+  readMirrorText,
+  withLogPageLimit,
+} from '../records/ledger-write-search-v1';
 import {
   LEDGER_HEAD_ADVANCED_TOPIC,
   RECORD_LANE_ABI_V38,
@@ -24,6 +37,13 @@ import {
  * scan and rate-limits the shared endpoint. The mirror node is a public
  * source PacSpace does not operate; a relying party can point the reader at
  * any mirror it trusts.
+ *
+ * The source is held to its own address, size and contract: every request
+ * goes to the base it was given, a redirect is not followed, no answer is
+ * read past `MIRROR_ANSWER_MAX_BYTES`, a page with more logs than were
+ * asked for is not read, and a next page is read only from the same source
+ * and this contract's log. Each of these ends the read with a
+ * `MirrorAnswerRefused`, without a retry.
  */
 export interface MirrorNodeReaderOptions {
   /** Mirror base URL; defaults from `chainId` through MIRROR_NODE_BY_CHAIN. */
@@ -67,8 +87,33 @@ interface MirrorLog {
 }
 
 interface MirrorLogsPage {
-  logs: MirrorLog[];
-  links?: { next?: string | null };
+  logs?: unknown;
+  links?: { next?: unknown };
+}
+
+const KEPT_TOPICS: readonly string[] = [RECORD_WRITTEN_TOPIC.toLowerCase(), LEDGER_HEAD_ADVANCED_TOPIC.toLowerCase()];
+
+/**
+ * A log of the scan as the reader keeps it: only the two events it reads
+ * (RecordWritten, LedgerHeadAdvanced) and only the seven values it uses, so
+ * what a history's scan holds in memory does not grow with what else the
+ * contract's log carries. Any other log is null.
+ */
+export function keptMirrorLog(raw: unknown): MirrorLog | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const log = raw as Partial<Record<keyof MirrorLog, unknown>>;
+  if (!Array.isArray(log.topics) || typeof log.data !== 'string') return null;
+  const topics = log.topics.map((topic) => String(topic));
+  if (!KEPT_TOPICS.includes((topics[0] ?? '').toLowerCase())) return null;
+  return {
+    address: log.address as string,
+    data: log.data,
+    index: log.index as number,
+    topics,
+    block_number: log.block_number as number,
+    transaction_hash: log.transaction_hash as string,
+    timestamp: log.timestamp as string,
+  };
 }
 
 export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptions): RecordChainReader {
@@ -82,23 +127,31 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
   const fetchImpl = options.fetchImpl ?? fetch;
   const iface = new ethers.Interface(RECORD_LANE_ABI_V38 as unknown as string[]);
 
+  /** One answer from the source: always the base and a path, never an address an answer gave. */
   async function request(path: string, init?: RequestInit): Promise<unknown> {
-    const url = path.startsWith('http') ? path : `${base}${path.startsWith('/') ? '' : '/'}${path}`;
+    const url = `${base}${path}`;
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const response = await fetchImpl(url, { ...init, signal: controller.signal });
+        const response = await fetchImpl(url, { ...init, redirect: 'manual', signal: controller.signal });
+        if (isMirrorRedirect(response)) {
+          await response.body?.cancel?.().catch(() => undefined);
+          throw mirrorRefusal.redirect(path);
+        }
         if (response.status === 429 || response.status >= 500) {
+          await response.body?.cancel?.().catch(() => undefined);
           lastError = new Error(`mirror node ${response.status} for ${path}`);
         } else if (!response.ok) {
-          const body = await response.text().catch(() => '');
+          const body = await readMirrorText(response, MIRROR_ANSWER_MAX_BYTES, path).catch(() => '');
           throw new Error(`mirror node ${response.status} for ${path}${body ? `: ${body.slice(0, 200)}` : ''}`);
         } else {
-          return (await response.json()) as unknown;
+          return await readMirrorJson(response, MIRROR_ANSWER_MAX_BYTES, path);
         }
       } catch (error) {
+        // A refused answer is the source's own doing: asking again would not change it.
+        if (mirrorRefusalOf(error)) throw error;
         if ((error as Error).name === 'AbortError') lastError = new Error(`mirror node request timed out after ${timeoutMs}ms (${path})`);
         else if (/^mirror node \d{3} for/.test((error as Error).message) && !/^mirror node (429|5\d\d)/.test((error as Error).message)) throw error;
         else lastError = error as Error;
@@ -149,21 +202,56 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
     // The mirror refuses a topic filter without a timestamp range of at most
     // seven days ("Cannot search topics without a valid timestamp range"), and
     // a full history spans months. The scan therefore reads the contract's
-    // logs unfiltered and applies the topics here; the contract emits only
-    // RecordWritten and LedgerHeadAdvanced, so the extra pages are bounded by
-    // the lane's own history. The mirror filters by consensus timestamp, not
-    // block; block bounds are applied client-side as well.
-    let next: string | null = `/api/v1/contracts/${contractAddress}/results/logs?${params.toString()}`;
+    // logs unfiltered and applies the topics here; the contract's other
+    // events are read past and not kept. The mirror filters by consensus
+    // timestamp, not block; block bounds are applied client-side as well.
+    let next: string | null = `${contractLogPath(contractAddress)}?${params.toString()}`;
     const out: MirrorLog[] = [];
     let pages = 0;
+    let size = pageSize;
     while (next) {
-      const page = (await request(next)) as MirrorLogsPage;
-      out.push(...(page.logs ?? []));
-      next = page.links?.next ?? null;
+      const { page, asked } = await readLogPage(next, size);
+      size = Math.min(pageSize, asked * 2);
+      // An answer that is no page at all (JSON null) throws here, as it always has: read as an empty page it would end a history early.
+      // The same holds for `logs` that is neither a list nor absent: it throws rather than read as an empty page.
+      const logs: unknown[] = Array.isArray(page.logs) ? page.logs : [...((page.logs ?? []) as Iterable<unknown>)];
+      if (logs.length > asked) throw mirrorRefusal.tooManyLogs(asked, next);
+      for (const raw of logs) {
+        const log = keptMirrorLog(raw);
+        if (log) out.push(log);
+      }
+      const link = page.links?.next;
+      if (link === null || link === undefined || link === '') {
+        next = null;
+      } else {
+        // A link that leaves the source or this contract's log ends the run: stopping quietly would cut a history short.
+        const path = nextLogPath(link, { base, contract: contractAddress });
+        if (!path) throw mirrorRefusal.nextPage();
+        next = withLogPageLimit(path, size);
+      }
       pages += 1;
       if (pages > 10_000) throw new Error('mirror node log scan exceeded 10,000 pages');
     }
     return out;
+  }
+
+  /**
+   * One page of the scan. A page over the size limit is asked for again with
+   * half as many logs, down to one, so a page that carries a few large logs
+   * is still read; only a single log over the limit is refused. The scan
+   * asks for the page after it at twice the size that was read, up to the
+   * full size, so a run of large logs is not asked for from the top each page.
+   */
+  async function readLogPage(path: string, start: number): Promise<{ page: MirrorLogsPage; asked: number }> {
+    let asked = start;
+    for (;;) {
+      try {
+        return { page: (await request(withLogPageLimit(path, asked))) as MirrorLogsPage, asked };
+      } catch (error) {
+        if (mirrorRefusalOf(error) !== 'too-large' || asked <= 1) throw error;
+        asked = Math.max(1, Math.floor(asked / 2));
+      }
+    }
   }
 
   async function scanLogs(topics: Array<string | null>, fromBlock: number, toBlock: number | 'latest'): Promise<MirrorLog[]> {
@@ -178,14 +266,18 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
     return out;
   }
 
-  /** One page of a write search: one attempt, no redirect followed, cut off after `ms`. */
+  /** One page of a write search: one attempt, no redirect followed, held to the size and count limits, cut off after `ms`. */
   async function searchPage(path: string, ms: number): Promise<MirrorLogsPage | 'timeout'> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ms);
     try {
       const response = await fetchImpl(`${base}${path}`, { headers: { accept: 'application/json' }, redirect: 'error', signal: controller.signal });
+      if (isMirrorRedirect(response)) throw mirrorRefusal.redirect(path);
       if (!response.ok) throw new Error(`mirror node ${response.status} for a record's writes`);
-      return (await response.json()) as MirrorLogsPage;
+      const page = (await readMirrorJson(response, MIRROR_ANSWER_MAX_BYTES, path)) as MirrorLogsPage;
+      // An answer that is no page at all (JSON null) throws here, as it always has, and the lookup says it was not read.
+      if (Array.isArray(page.logs) && page.logs.length > LEDGER_WRITE_SEARCH_PAGE_LIMIT) throw mirrorRefusal.tooManyLogs(LEDGER_WRITE_SEARCH_PAGE_LIMIT, path);
+      return page;
     } catch (error) {
       if (controller.signal.aborted) return 'timeout';
       throw error;
@@ -280,10 +372,11 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
           requests += 1;
           const page = await searchPage(path, left);
           if (page === 'timeout') return end('timeout');
-          for (const log of Array.isArray(page.logs) ? page.logs : []) {
-            const write = parseLedgerWriteLog(log, { topic0, recordKey: key });
+          for (const log of Array.isArray(page?.logs) ? page.logs : []) {
+            // The shared parse holds the log to this record and this contract, as the page's finder does.
+            const write = parseLedgerWriteLog(log, { topic0, recordKey: key, contractAddress });
             // The stricter time pattern: a value this reader prints is the mirror's consensus timestamp or nothing.
-            if (!write || write.address !== contractAddress || !CONSENSUS_TIMESTAMP.test(write.timestamp)) continue;
+            if (!write || !CONSENSUS_TIMESTAMP.test(write.timestamp)) continue;
             writes.push({
               previousWord: write.previousWord,
               newWord: write.newWord,
@@ -297,7 +390,10 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
             });
           }
           if (search.done(writes)) return end('done');
-          path = nextLedgerWritePath(page.links?.next);
+          const link = page?.links?.next;
+          path = nextLogPath(link, { base, contract: contractAddress });
+          // As in the scan: a link that leaves the source or this contract's log ends the lookup as not read, not as a shorter page.
+          if (!path && link !== null && link !== undefined && link !== '') throw mirrorRefusal.nextPage();
         }
         upper = lower;
       }

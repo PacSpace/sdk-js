@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.5 - 2026-11-17
+
+### Security
+
+- Reads from a mirror (the default source or `--source <url>`) hold the source to its own address: a redirect is not followed, and a next page is read only from the same source and the same contract's log. A page with more logs than were asked for is not read. A page larger than 1 MiB is asked for again in smaller pages, and a single answer larger than 1 MiB is not read. With a source that does any of these the report says the proof layer was not read, and why, and the exit code is the one for a proof layer that could not be reached. A source given as `http://` that redirects to `https://` must now be given as `https://`. The list of where each entry was committed reads its pages under the same limits.
+
 ## 0.5.4 - 2026-11-16
 
 ### Added

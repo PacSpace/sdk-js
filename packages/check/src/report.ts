@@ -9,11 +9,30 @@
  * Record page's, verbatim.
  */
 
+import type { MirrorRefusalCode } from '@pacspace/shared';
+
 export const REPORT_SCHEMA = 'pacspace-check-report/v1' as const;
+
+/**
+ * Why a source's answer was not read, by the reader's refusal code. Each command puts the reason in its own
+ * sentence; nothing the source sent is printed.
+ */
+export const SOURCE_REFUSAL_REASONS: Record<MirrorRefusalCode, string> = {
+  redirect: 'its source answered with a redirect, which is not followed',
+  'too-large': 'its source gave an answer larger than this checker reads',
+  'too-many-logs': 'its source returned a longer page than was asked for',
+  'next-page': 'its source pointed somewhere else for the next page',
+};
 
 export type SourceOutcome =
   | { compared: false; reason: 'offline' }
-  | { compared: false; reason: 'unreachable'; detail: string }
+  | {
+      compared: false;
+      reason: 'unreachable';
+      detail: string;
+      /** Present only when the source answered and its answer was refused: which rule it broke. */
+      refused?: MirrorRefusalCode;
+    }
   | {
       compared: true;
       matches: boolean;
@@ -341,10 +360,16 @@ export function sealsVerdict(entries: number | null, v: SealsFacts, queued: numb
   return { sentence: sealsPassedSentence(entries), passed: true };
 }
 
+/** The refusal code of a source that answered and was refused; undefined for any other outcome. */
+export function refusedOf(source: SourceOutcome): MirrorRefusalCode | undefined {
+  return !source.compared && source.reason === 'unreachable' ? source.refused : undefined;
+}
+
 export function sourceSentence(source: SourceOutcome): string {
   if (!source.compared) {
-    return source.reason === 'offline'
-      ? 'Not compared with the proof layer. The check ran on this file alone.'
+    if (source.reason === 'offline') return 'Not compared with the proof layer. The check ran on this file alone.';
+    return source.refused
+      ? `The proof layer was not read: ${SOURCE_REFUSAL_REASONS[source.refused]}. The check ran on this file alone.`
       : 'The proof layer could not be reached. The check ran on this file alone.';
   }
   return source.matches

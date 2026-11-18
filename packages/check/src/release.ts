@@ -1,4 +1,6 @@
+import type { MirrorRefusalCode } from '@pacspace/shared';
 import { checkHistory, HistoryFileError, parseHistoryFile, type CheckOptions } from './check';
+import { refusedOf, SOURCE_REFUSAL_REASONS } from './report';
 
 export const RELEASES_SCHEMA = 'pacspace-releases/v1';
 export const RELEASE_MANIFEST_FORMAT = 'pacspace-release-manifest/v2';
@@ -43,6 +45,7 @@ export const releaseWords = {
   inProgress: (served: string, latest: string) =>
     `The host serves ${served}; the release record's latest entry is ${latest}. A release may be in progress; run it again in a few minutes.`,
   unreachable: (origin: string) => `Couldn't reach ${origin} or the ledger. Nothing was checked.`,
+  refused: (code: MirrorRefusalCode) => `The ledger was not read: ${SOURCE_REFUSAL_REASONS[code]}. Nothing was checked.`,
   total: (n: number) => (n === 1 ? '1 difference from the release record.' : `${n} differences from the release record.`),
 } as const;
 
@@ -111,6 +114,8 @@ export interface ReleaseReport {
   stagingRecord?: string;
   /** 0 everything matches; 1 any difference, or any staging run; 2 the host or the ledger could not be reached. */
   exitCode: 0 | 1 | 2;
+  /** Present only with `unreachable` when the ledger's source answered and its answer was refused: which rule it broke. */
+  refused?: MirrorRefusalCode;
 }
 
 /** One answer as the host sent it: no decoding, every header. */
@@ -304,11 +309,12 @@ async function checkPinned(
     files: 0,
     differences: [],
   };
-  const unreachable = (): ReleaseReport => ({
+  const unreachable = (refused?: MirrorRefusalCode): ReleaseReport => ({
     ...base,
     outcome: 'unreachable',
-    sentences: [releaseWords.unreachable(origin)],
+    sentences: [refused ? releaseWords.refused(refused) : releaseWords.unreachable(origin)],
     exitCode: 2,
+    ...(refused ? { refused } : {}),
   });
   const differs = (differences: ReleaseDifference[], extra: Partial<ReleaseReport> = {}): ReleaseReport => ({
     ...base,
@@ -365,7 +371,7 @@ async function checkPinned(
       throw error;
     }
     if (report.exitCode === 3 || (report.source.compared === false && report.source.reason === 'unreachable')) {
-      return unreachable();
+      return unreachable(refusedOf(report.source));
     }
     if (!report.passed) return differs([{ kind: 'differs', path: historyPath }]);
     const latest = report.record.entries;

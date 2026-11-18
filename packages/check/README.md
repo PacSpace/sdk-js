@@ -137,7 +137,7 @@ fingerprint comparison; and the sentences printed above.
 
 Node.js 20.19 or later, and the network, for the proof layer. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace. Where a record was committed is named inside the history
 file; `--source` and `--rpc` point the checker at a mirror or endpoint of
-your own.
+your own. A redirect from a source is not followed. Pass the address it leads to; a source given as `http://` usually needs `https://`. When a report says the proof layer was not read because of its source, name another source, or read without a mirror with `--rpc <url>`.
 
 ## License
 
