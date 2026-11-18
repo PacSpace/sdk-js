@@ -39,4 +39,6 @@ export type {
   SealsReportInput,
   SourceOutcome,
   VerificationFacts,
+  EntryWrite,
+  WritesOutcome,
 } from './report';

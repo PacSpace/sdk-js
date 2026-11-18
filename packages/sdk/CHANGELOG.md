@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.2 - 2026-11-17
+
+### Security
+
+- Reads from a mirror source (records.check() and the calls that take the same source) hold the source to its own address: a redirect is not followed. A single answer larger than 1 MiB is not read. With such a source, records.check() answers sourceChecked: false, and records.open() and records.disclose() refuse with DISCLOSURE_CHAIN_ROOT_MISSING, as they do for a source that cannot be reached.
+
 ## 0.15.1 - 2026-11-15
 
 ### Changed

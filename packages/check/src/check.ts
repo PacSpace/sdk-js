@@ -33,10 +33,12 @@ import {
   verifyRecordHistoryBundle,
   verifyRecordHistoryBundleV3,
   verifyRecordSealHistoryV1,
+  mirrorRefusalOf,
   type BundleVerificationV1,
   type EncryptedReadRefusalV1,
   type HeldFile,
   type LayoutRegistry,
+  type MirrorRefusalCode,
   type RecordChainReader,
   type RecordDisclosure,
   type RecordHistoryBundleV1,
@@ -57,6 +59,7 @@ import {
   type HeldFileOutcome,
   type SourceOutcome,
 } from './report';
+import { lookUpWrites, wantedEntriesOf, writeLinkFor, WRITES_LOOKUP_DEFAULT_BUDGET_MS } from './writes';
 
 declare const __PACSPACE_CHECK_VERSION__: string | undefined;
 
@@ -138,6 +141,15 @@ export interface CheckOptions {
   recordKey?: Uint8Array;
   /** Called with a disclosure's revealed fields once they verified; never for fields that failed. */
   onRevealed?: (entries: RevealedEntry[]) => void;
+  /**
+   * After a words history or kept copy passes and matches the proof layer, also look up where each
+   * entry was committed and carry it in the report's `writes`. Off unless passed. Information only:
+   * the verdict, the sentences and the exit code are built first and are what they would be without it.
+   */
+  writes?: boolean;
+  /** Test seams for the lookup: its window and its clock. */
+  writesWindowSeconds?: number;
+  writesNow?: () => number;
 }
 
 /** One disclosed entry's fields as the reader sees them: entries count from 1. */
@@ -265,9 +277,46 @@ function readerFor(
       contractAddress,
       timeoutMs: options.timeoutMs,
       fetchImpl: options.fetchImpl,
+      // With --full the run reads the contract's whole log once; the lookup then asks nothing more.
+      keepLogPages: !!options.writes && !!options.full,
     }),
     readsFrom: mirrorBaseUrl,
   };
+}
+
+/**
+ * The report, with where each entry was committed when the caller asked and the file is unchanged and
+ * matches the proof layer. The report it is given is finished: nothing in it is built again, and a
+ * lookup that fails, hangs or answers nonsense adds only `writes: { read: false }`.
+ */
+async function withWrites(
+  report: CheckReport,
+  bundle: { recordKey?: unknown; chain?: { chainId?: unknown; contractAddress?: unknown }; receipts?: unknown; exportedAt?: unknown },
+  verification: BundleVerificationV1,
+  reader: RecordChainReader | null,
+  options: CheckOptions,
+): Promise<CheckReport> {
+  if (!options.writes || !reader || !report.passed || !report.file.intact || !report.source.compared || !report.source.matches) return report;
+  let writes: CheckReport['writes'];
+  try {
+    const source = options.source ?? 'mirror';
+    const verified = new Set((verification.history?.perReceipt ?? []).filter((row) => row.result.verified).map((row) => row.seq));
+    writes = await lookUpWrites({
+      reader,
+      recordKey: String(bundle.recordKey),
+      contractAddress: String(bundle.chain?.contractAddress ?? ''),
+      wanted: wantedEntriesOf(bundle.receipts, verified),
+      startAt: typeof bundle.exportedAt === 'string' ? bundle.exportedAt : null,
+      whole: !!options.full && typeof source === 'string',
+      budgetMs: options.timeoutMs ?? WRITES_LOOKUP_DEFAULT_BUDGET_MS,
+      linkFor: writeLinkFor(source, bundle.chain?.chainId),
+      windowSeconds: options.writesWindowSeconds,
+      now: options.writesNow,
+    });
+  } catch {
+    writes = { read: false, reason: 'unreachable' };
+  }
+  return { ...report, writes };
 }
 
 const PAYLOAD_POINTER = /^\/payloads\/(0|[1-9][0-9]*)$/;
@@ -485,9 +534,11 @@ async function checkBundle(file: HistoryFile, options: CheckOptions): Promise<Ch
   let source: SourceOutcome;
   let verification = offline;
   let sequence: StatementSequence | null = null;
+  let sourceReader: RecordChainReader | null = null;
   try {
     const found = readerFor(bundle.chain, options);
     const reader = options.full ? memoizeSequenceReads(found.reader) : found.reader;
+    sourceReader = reader;
     const level: SlotVerificationLevel = options.full ? 'ledger' : 'semantic';
     const live = v2
       ? await verifyBundleV2WithSource(reader, file as unknown as RecordHistoryBundleV2, level, layouts)
@@ -514,16 +565,17 @@ async function checkBundle(file: HistoryFile, options: CheckOptions): Promise<Ch
     };
   } catch (error) {
     if (error instanceof HistoryFileError) throw error;
-    source = { compared: false, reason: 'unreachable', detail: (error as Error).message };
+    source = notReached(error);
   }
 
-  return buildReport({
+  const report = buildReport({
     ...base,
     verification,
     source,
     dailyStatement: dailyStatementOf(file, verification.verified, sequence),
     heldFile: heldOf(verification, false),
   });
+  return withWrites(report, bundle, verification, sourceReader, options);
 }
 
 /** An encrypted history's refusal as a report sentence (W-L2d-27 to W-L2d-29, W-L2g-4); null when the file is not one this version reads. */
@@ -615,9 +667,11 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
   let source: SourceOutcome;
   let result = offline;
   let sequence: StatementSequence | null = null;
+  let sourceReader: RecordChainReader | null = null;
   try {
     const found = readerFor(bundle.chain, options);
     const reader = options.full ? memoizeSequenceReads(found.reader) : found.reader;
+    sourceReader = reader;
     const contractMatches =
       !!bundle.chain?.contractAddress && bundle.chain.contractAddress.toLowerCase() === reader.contractAddress.toLowerCase();
     const chainWord = await reader.getRecord(bundle.recordKey);
@@ -653,10 +707,10 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
     };
   } catch (error) {
     if (error instanceof HistoryFileError) throw error;
-    source = { compared: false, reason: 'unreachable', detail: (error as Error).message };
+    source = notReached(error);
   }
 
-  return buildReport({
+  const report = buildReport({
     ...base,
     verification: result.verification,
     source,
@@ -664,6 +718,7 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
     heldFile: heldOf(result.verification, result.opened, false),
     encrypted,
   });
+  return withWrites(report, bundle, result.verification, sourceReader, options);
 }
 
 /** The record's entry count from its current word, as the page's hero reads it; null when it cannot be read. */
@@ -690,19 +745,33 @@ function ledgerAgrees(form: RecordSealHistoryV1, material: { genesisHead: string
 }
 
 /** A reader that records which batch ids the source answered at all, so a refused root is told from an unread one. */
-function answeringReader(reader: RecordChainReader): { reader: RecordChainReader; answered: Set<string> } {
+function answeringReader(reader: RecordChainReader): { reader: RecordChainReader; answered: Set<string>; refused: () => MirrorRefusalCode | undefined } {
   const answered = new Set<string>();
+  let refused: MirrorRefusalCode | undefined;
   return {
     answered,
+    // The first refusal of the source's answer, when a root was not read for that and not for want of an answer.
+    refused: () => refused,
     reader: {
       ...reader,
       getBatchRoot: async (batchId) => {
-        const root = await reader.getBatchRoot(batchId);
-        answered.add(String(batchId));
-        return root;
+        try {
+          const root = await reader.getBatchRoot(batchId);
+          answered.add(String(batchId));
+          return root;
+        } catch (error) {
+          refused ??= mirrorRefusalOf(error) ?? undefined;
+          throw error;
+        }
       },
     },
   };
+}
+
+/** A source that was not read: one that could not be reached, or, with `refused`, one whose answer the reader refused. */
+function notReached(error: unknown): SourceOutcome {
+  const refused = mirrorRefusalOf(error);
+  return { compared: false, reason: 'unreachable', detail: (error as Error).message, ...(refused ? { refused } : {}) };
 }
 
 /** A JSON Pointer token for an object member's name. */
@@ -758,6 +827,8 @@ export interface CommittedEntriesOutcome {
   /** True when every entry's batch root is the proof layer's; false when one differs; null when not read (offline, or unreachable). */
   rootsOk: boolean | null;
   unreachable: boolean;
+  /** With `unreachable`: the source answered and its answer was refused, and which rule it broke. */
+  refused?: MirrorRefusalCode;
   disclosure: DisclosureOutcome | null;
   revealed: RevealedEntry[];
 }
@@ -783,7 +854,10 @@ export async function checkCommittedEntries(form: RecordSealHistoryV1, disclosur
   }
   const recorded = answeringReader(reader);
   const { chainRoots, leftOut } = await readChainRootsV1(recorded.reader, form.entries.map((e) => String(e.batchId)));
-  if (leftOut.some((id) => !recorded.answered.has(id))) return { ...none, formOk: true, unreachable: true };
+  if (leftOut.some((id) => !recorded.answered.has(id))) {
+    const refused = recorded.refused();
+    return { ...none, formOk: true, unreachable: true, ...(refused ? { refused } : {}) };
+  }
   const rootsOk = form.entries.every((e) => sameHexRoot(chainRoots[String(e.batchId)], e.proofRoot));
   const revealed: RevealedEntry[] = [];
   const outcome = disclosure && rootsOk ? await checkDisclosure(form, disclosure, reader, (entries) => revealed.push(...entries)) : null;
@@ -855,7 +929,7 @@ async function checkSeals(
     };
   } catch (error) {
     if (error instanceof HistoryFileError) throw error;
-    source = { compared: false, reason: 'unreachable', detail: (error as Error).message };
+    source = notReached(error);
     reader = null;
   }
 

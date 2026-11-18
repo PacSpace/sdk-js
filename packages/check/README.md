@@ -34,10 +34,24 @@ Proof layer                  <the proof layer mirror the record names>
 
 This record has 3 entries. All 3 are here, and all 3 match what was committed.
 Compared with the proof layer for this record: it matches.
+Where each entry was committed on the proof layer:
+Entry 1: committed 11 September 2026, 23:58:07 UTC
+  https://hashscan.io/mainnet/transaction/0x5d1c...9a3e
+Entries 2 and 3: committed 12 September 2026, 00:41:19 UTC
+  https://hashscan.io/mainnet/transaction/0x81f0...c27b
 Daily statement of 12 September 2026 (UTC): matches.
 The fingerprint you gave names this file.
 The check shows the record is unchanged since it was committed. It does not show that what was recorded was true.
 ```
+
+After a history file passes and matches the proof layer, the report lists
+where each entry was committed: the time, and a link to the write. The
+link opens that write on an explorer of the proof layer, which shows the
+same time in your own time zone. `--json` carries the same in a `writes`
+field. This is information only: when it cannot be read the report says
+so, and the result and the exit code are what they were. `--no-lookup`
+leaves it out, `--offline` never makes it, and `release`, `open` and
+`evidence` do not make it.
 
 ## What it checks
 
@@ -95,6 +109,7 @@ release reads each file three ways, as the host sends it, and checks each answer
 --source <url>         read the proof layer from this mirror
 --rpc <url>            read the proof layer over JSON-RPC at this URL
 --full                 also read every daily statement
+--no-lookup            do not look up where each entry was committed
 --timeout <ms>         network timeout per read (default 10000)
 --json                 print the report as JSON
 ```
@@ -122,7 +137,7 @@ fingerprint comparison; and the sentences printed above.
 
 Node.js 20.19 or later, and the network, for the proof layer. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace. Where a record was committed is named inside the history
 file; `--source` and `--rpc` point the checker at a mirror or endpoint of
-your own.
+your own. A redirect from a source is not followed. Pass the address it leads to; a source given as `http://` usually needs `https://`. When a report says the proof layer was not read because of its source, name another source, or read without a mirror with `--rpc <url>`.
 
 ## License
 

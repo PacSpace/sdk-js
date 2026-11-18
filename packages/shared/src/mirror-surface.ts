@@ -18,6 +18,7 @@ export { assertNoBlindingMaterial } from './proof/payload-ref-v1';
 export { RecordIntakeError } from './proof/layout-document-v1';
 export * from './records/layouts';
 export * from './records/inspect-record-calldata-v1';
+export * from './records/ledger-write-search-v1';
 export * from './proof/semantic-receipt-v2';
 export * from './proof/ledger-head-v1';
 export { decodeStateV1 } from './proof/layout-document-v1';

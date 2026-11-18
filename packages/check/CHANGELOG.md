@@ -2,12 +2,24 @@
 
 ## Unreleased
 
-Goes out as 0.6.0 with the export check (D-42); until then the checker reports its version as 0.5.0.
+Goes out as 0.6.0 with the export check (D-42); until then the checker reports its version as 0.5.5.
 
 ### Added
 
 - `pacspace-check evidence <evidence.json> [--offline | --source <url> | --rpc <url>]` checks a Shared Record evidence file (`shared-record-evidence/v1`, Full or For reviewers): both of the reader device's signatures over the file's JCS, that the device is one the file lists as confirmed or since revoked, each acknowledgment against the digest the link's own record committed, and each record and answer against the proof layer. Exit 0 passes, 1 fails, 2 is a usage error, a file it cannot read, or a check that could not run, and 3 is a proof layer it cannot reach, which claims no match. `--offline` names what it did not check.
 - `pacspace-check sample <evidence.json>` re-derives each sample request's picks from its seed and pool and fails a changed pick or pool.
+
+## 0.5.5 - 2026-11-17
+
+### Security
+
+- Reads from a mirror (the default source or `--source <url>`) hold the source to its own address: a redirect is not followed, and a next page is read only from the same source and the same contract's log. A page with more logs than were asked for is not read. A page larger than 1 MiB is asked for again in smaller pages, and a single answer larger than 1 MiB is not read. With a source that does any of these the report says the proof layer was not read, and why, and the exit code is the one for a proof layer that could not be reached. A source given as `http://` that redirects to `https://` must now be given as `https://`. The list of where each entry was committed reads its pages under the same limits.
+
+## 0.5.4 - 2026-11-16
+
+### Added
+
+- After a history file passes and matches the proof layer, the report lists where each entry was committed: the time, and a link to the write on an explorer of the proof layer. `--json` carries the same in a new `writes` field. This is information only: when it cannot be read the report says so, and the result and the exit code are what they were. `--no-lookup` leaves it out, `--offline` never makes it, and `release` and `open` do not make it.
 
 ## 0.5.3 - 2026-11-15
 

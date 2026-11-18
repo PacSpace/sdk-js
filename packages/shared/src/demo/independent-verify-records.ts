@@ -95,6 +95,32 @@ export interface RecordWrite {
   blockNumber?: number;
   transactionHash?: string;
   logIndex?: number;
+  /** When the source says the write was committed, ISO 8601; a mirror's consensus time, or a block's time over JSON-RPC. */
+  committedAt?: string;
+  /** The contract the log names, lower case. */
+  contractAddress?: string;
+}
+
+/** A bounded search for some of a record's writes, newest first. */
+export interface RecordWriteSearch {
+  /** A hint for where to start: the search begins a day after it, or from now when it is missing or unusable. */
+  startAt?: string | null;
+  /** Asked after each page; true ends the search. */
+  done: (writes: RecordWrite[]) => boolean;
+  /** One budget for the whole search, milliseconds. */
+  budgetMs: number;
+  /** At most this many requests, one at a time, one attempt each. */
+  maxRequests: number;
+  /** Seconds per window; a mirror refuses seven days or more. */
+  windowSeconds?: number;
+  now?: () => number;
+}
+
+export interface RecordWriteSearchResult {
+  writes: RecordWrite[];
+  /** `done` when the caller had what it asked for; `limit` at the request cap or the budget; `timeout` when a request was cut off by the budget. */
+  ended: 'done' | 'limit' | 'timeout';
+  requests: number;
 }
 
 export interface RecordChainReader {
@@ -107,6 +133,11 @@ export interface RecordChainReader {
   getLedgerAdvances(fromBlock?: number, toBlock?: number | 'latest'): Promise<LedgerAdvance[]>;
   /** Every RecordWritten for one record key in [fromBlock, toBlock], in log order. */
   getRecordWrites(recordKey: string, fromBlock?: number, toBlock?: number | 'latest'): Promise<RecordWrite[]>;
+  /**
+   * Some of a record's writes, read back from the newest within a budget. A refused or failed request throws;
+   * nothing is retried. Information only: no verifier calls it.
+   */
+  findRecordWrites?(recordKey: string, search: RecordWriteSearch): Promise<RecordWriteSearchResult>;
 }
 
 export interface RpcReaderOptions {
@@ -225,6 +256,68 @@ export function createRpcRecordChainReader(options: RpcReaderOptions): RecordCha
         });
       }
       return out;
+    },
+    async findRecordWrites(recordKey, search) {
+      const key = normalizeProofHash(recordKey, 'recordKey');
+      const now = search.now ?? Date.now;
+      const deadline = now() + search.budgetMs;
+      const writes: RecordWrite[] = [];
+      const blockTimes = new Map<number, string>();
+      let requests = 0;
+      const CUT = Symbol('cut');
+      // One request inside what is left of the budget; CUT when the budget ends first.
+      const within = async <T>(p: Promise<T>): Promise<T | typeof CUT> => {
+        const left = deadline - now();
+        if (left <= 0) return CUT;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const cut = new Promise<typeof CUT>((resolve) => {
+          timer = setTimeout(() => resolve(CUT), left);
+        });
+        p.catch(() => undefined);
+        try {
+          return await Promise.race([p, cut]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+      const end = (ended: RecordWriteSearchResult['ended']): RecordWriteSearchResult => ({ writes, ended, requests });
+      if (search.maxRequests < 1) return end('limit');
+      requests += 1;
+      const latest = await within(provider.getBlockNumber());
+      if (latest === CUT) return end('timeout');
+      for (let to = latest; to >= 0; to -= chunk) {
+        if (search.done(writes)) return end('done');
+        if (requests >= search.maxRequests || now() >= deadline) return end('limit');
+        requests += 1;
+        const logs = await within(provider.getLogs({ address: contractAddress, topics: [RECORD_WRITTEN_TOPIC, key], fromBlock: Math.max(0, to - chunk + 1), toBlock: to }));
+        if (logs === CUT) return end('timeout');
+        for (const log of [...logs].reverse()) {
+          const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+          if (!parsed) continue;
+          let committedAt = blockTimes.get(log.blockNumber);
+          if (committedAt === undefined) {
+            if (requests >= search.maxRequests || now() >= deadline) return end('limit');
+            requests += 1;
+            const block = await within(provider.getBlock(log.blockNumber));
+            if (block === CUT) return end('timeout');
+            if (!block || !Number.isSafeInteger(block.timestamp)) throw new Error(`getBlock ${log.blockNumber} returned no time`);
+            committedAt = new Date(block.timestamp * 1000).toISOString();
+            blockTimes.set(log.blockNumber, committedAt);
+          }
+          writes.push({
+            previousWord: hex256(BigInt(parsed.args.previousWord)),
+            newWord: hex256(BigInt(parsed.args.newWord)),
+            operator: String(parsed.args.operator).toLowerCase(),
+            encodingVersion: Number(parsed.args.encodingVersion),
+            blockNumber: log.blockNumber,
+            transactionHash: String(log.transactionHash).toLowerCase(),
+            logIndex: log.index,
+            committedAt,
+            contractAddress: String(log.address).toLowerCase(),
+          });
+        }
+      }
+      return end(search.done(writes) ? 'done' : 'limit');
     },
   };
 }

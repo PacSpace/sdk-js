@@ -13,6 +13,7 @@ import {
   sharedRecordEvidenceV1KeyProblems,
   type EvidenceRecordV1,
   type EvidenceSystemRecordV1,
+  type MirrorRefusalCode,
   type RecordDisclosure,
   type RecordSealHistoryV1,
   type SharedRecordAckBodyV2,
@@ -21,6 +22,7 @@ import {
 import { isDeepStrictEqual } from './equal';
 import { loadDeviceSignature } from './device-signature';
 import { CHECKER_NAME, CHECKER_VERSION, checkCommittedEntries, checkHistory, type CheckOptions, type RevealedEntry } from '../check';
+import { refusedOf, type CheckReport } from '../report';
 import { EVIDENCE_WORDS as W } from './words';
 
 export const EVIDENCE_REPORT_SCHEMA = 'pacspace-check-evidence-report/v1' as const;
@@ -40,7 +42,18 @@ export interface EvidenceReport {
   lines: EvidenceLine[];
   /** 0 every check passed; 1 one did not; 2 the file could not be used; 3 the proof layer could not be reached (before 1, as the checker's other commands). */
   exitCode: 0 | 1 | 2 | 3;
+  /** Present only with exit code 3 when the proof layer's source answered and its answer was refused: which rule it broke. */
+  refused?: MirrorRefusalCode;
 }
+
+/** Whether the proof layer was read, and, when its source's answer was refused, which rule it broke. */
+interface Reach {
+  notRead: boolean;
+  refused?: MirrorRefusalCode;
+}
+const REACHED: Reach = { notRead: false };
+const reachOf = (report: CheckReport): Reach => (report.exitCode === 3 ? { notRead: true, refused: refusedOf(report.source) } : REACHED);
+const both = (a: Reach, b: Reach): Reach => ({ notRead: a.notRead || b.notRead, refused: a.refused ?? b.refused });
 
 export type EvidenceOptions = Pick<CheckOptions, 'source' | 'timeoutMs' | 'fetchImpl'>;
 
@@ -89,7 +102,7 @@ export function readEvidenceFile(value: unknown): SharedRecordEvidenceV1 {
 export async function checkEvidence(file: SharedRecordEvidenceV1, options: EvidenceOptions = {}): Promise<EvidenceReport> {
   const lines: EvidenceLine[] = [];
   const add = (check: string, passed: boolean | null, sentence: string) => lines.push({ check, passed, sentence });
-  let unreachable = false;
+  let reach = REACHED;
   const full = file.edition === 'full';
   add('edition', null, W.edition(file.edition));
 
@@ -104,7 +117,7 @@ export async function checkEvidence(file: SharedRecordEvidenceV1, options: Evide
   const closeFailed: number[] = [];
   for (const record of file.records) {
     const report = await checkHistory(record.sealHistory as never, options);
-    if (report.exitCode === 3) unreachable = true;
+    reach = both(reach, reachOf(report));
     const sealsAgree = record.seals.length === record.entries && record.sealHistory.entries.length === record.entries && record.seals.every((s, i) => hex(s) === hex(record.sealHistory.entries[i]?.seal));
     if (options.source === 'offline') add(`record ${record.record}`, report.passed && sealsAgree ? null : false, report.passed && sealsAgree ? W.recordOffline(record.record) : W.recordDiffers(record.record));
     else if (report.exitCode !== 3) add(`record ${record.record}`, report.passed && sealsAgree, report.passed && sealsAgree ? W.recordMatches(record.record, record.entries) : W.recordDiffers(record.record));
@@ -114,17 +127,17 @@ export async function checkEvidence(file: SharedRecordEvidenceV1, options: Evide
   if (closeFailed.length) for (const n of closeFailed) add('close', false, W.closeDiffers(n));
   else add('close', true, W.closeMatches(file.records.length));
 
-  if (full) unreachable = (await revealedAndAnswered(file, options, add)) || unreachable;
+  if (full) reach = both(reach, await revealedAndAnswered(file, options, add));
   else answeredSeals(file, add);
 
   const held = await acknowledgments(file, add);
 
-  unreachable = (await indexRecord(file, options, add)) || unreachable;
-  unreachable = (await readerRecord(file, held, options, add)) || unreachable;
+  reach = both(reach, await indexRecord(file, options, add));
+  reach = both(reach, await readerRecord(file, held, options, add));
 
-  if (unreachable) add('proof layer', null, W.unreachable);
+  if (reach.notRead) add('proof layer', null, reach.refused ? W.refused(reach.refused) : W.unreachable);
   const failed = lines.some((l) => l.passed === false);
-  const exitCode = unreachable ? 3 : failed ? 1 : 0;
+  const exitCode = reach.notRead ? 3 : failed ? 1 : 0;
   // The boundary says what a check that passed shows, so it is said only then (as a history's report does).
   if (exitCode === 0) add('boundary', null, W.boundary);
   return {
@@ -134,6 +147,7 @@ export async function checkEvidence(file: SharedRecordEvidenceV1, options: Evide
     edition: file.edition,
     lines,
     exitCode,
+    ...(reach.notRead && reach.refused ? { refused: reach.refused } : {}),
   };
 }
 
@@ -159,23 +173,23 @@ async function signature(file: SharedRecordEvidenceV1, add: Add): Promise<void> 
 }
 
 /** Full: each record's revealed fields and each answer's shown fields, from their disclosures, against the entries' seals. */
-async function revealedAndAnswered(file: SharedRecordEvidenceV1, options: EvidenceOptions, add: Add): Promise<boolean> {
+async function revealedAndAnswered(file: SharedRecordEvidenceV1, options: EvidenceOptions, add: Add): Promise<Reach> {
   const byNumber = new Map(file.records.map((r) => [r.record, r]));
   const unprovenRecords = new Set(file.records.filter((r) => r.disclosure === undefined && (r.revealed?.length ?? 0) > 0).map((r) => r.record));
   const unprovenAnswers = new Set(file.answers.filter((a) => a.entries.some((e) => 'fields' in e && e.fields !== undefined && e.disclosure === undefined)).map((a) => a.request));
   for (const record of unprovenRecords) add(`revealed ${record}`, false, W.revealedDiffer(record));
   for (const request of unprovenAnswers) add(`answer ${request}`, false, W.answerDiffers(request));
   const anyDisclosure = file.records.some((r) => r.disclosure !== undefined) || file.answers.some((a) => a.entries.some((e) => 'disclosure' in e && e.disclosure !== undefined));
-  if (!anyDisclosure) return false;
+  if (!anyDisclosure) return REACHED;
   if (options.source === 'offline') {
     add('fields', null, W.notCheckedOffline);
-    return false;
+    return REACHED;
   }
-  let unreachable = false;
+  let reach = REACHED;
   const open = async (record: EvidenceRecordV1, disclosure: unknown) => {
     const revealed: RevealedEntry[] = [];
     const report = await checkHistory(disclosure as never, { ...options, history: record.sealHistory as never, onRevealed: (entries) => revealed.push(...entries) });
-    if (report.exitCode === 3) unreachable = true;
+    reach = both(reach, reachOf(report));
     return { passed: report.passed, unreachable: report.exitCode === 3, revealed };
   };
   for (const record of file.records) {
@@ -220,7 +234,7 @@ async function revealedAndAnswered(file: SharedRecordEvidenceV1, options: Eviden
     // An entry whose disclosure the proof layer did not answer is unchecked: the answer claims no match for it.
     if (shown && !(ok && notReached)) add(`answer ${answer.request}`, ok, ok ? W.answerMatches(answer.request, shown) : W.answerDiffers(answer.request));
   }
-  return unreachable;
+  return reach;
 }
 
 /** For reviewers: each answered entry carries the seal its record committed for it. */
@@ -320,12 +334,12 @@ function flagsAgree(listed: SharedRecordEvidenceV1['acknowledgments'][number]['f
 }
 
 /** A PacSpace-written record's entries as the file's disclosure shows them, each checked to be committed: by entry title. */
-async function systemEntries(which: 'index' | 'reader', system: EvidenceSystemRecordV1, options: EvidenceOptions, add: Add): Promise<{ unreachable: boolean; byTitle: Map<string, Record<string, unknown>> | null }> {
+async function systemEntries(which: 'index' | 'reader', system: EvidenceSystemRecordV1, options: EvidenceOptions, add: Add): Promise<{ reach: Reach; byTitle: Map<string, Record<string, unknown>> | null }> {
   const outcome = await checkCommittedEntries(system.sealHistory as RecordSealHistoryV1, system.disclosure as RecordDisclosure, options);
-  if (outcome.unreachable) return { unreachable: true, byTitle: null };
+  if (outcome.unreachable) return { reach: { notRead: true, refused: outcome.refused }, byTitle: null };
   if (!outcome.formOk || outcome.rootsOk === false || (outcome.disclosure && outcome.disclosure.kind !== 'verified')) {
     add(which, false, W.systemDiffers(which));
-    return { unreachable: false, byTitle: null };
+    return { reach: REACHED, byTitle: null };
   }
   const byTitle = new Map<string, Record<string, unknown>>();
   for (const entry of outcome.revealed) {
@@ -333,21 +347,21 @@ async function systemEntries(which: 'index' | 'reader', system: EvidenceSystemRe
     for (const f of entry.fields) fields[f.pointer] = f.value;
     if (typeof fields['/title'] === 'string') byTitle.set(fields['/title'] as string, fields);
   }
-  return { unreachable: false, byTitle };
+  return { reach: REACHED, byTitle };
 }
 
 /** When the file holds the index record: each record's join commits its close's facts, and each removal is committed. */
-async function indexRecord(file: SharedRecordEvidenceV1, options: EvidenceOptions, add: Add): Promise<boolean> {
+async function indexRecord(file: SharedRecordEvidenceV1, options: EvidenceOptions, add: Add): Promise<Reach> {
   if (!file.indexRecord) {
     add('index', null, W.indexNotHeld);
-    return false;
+    return REACHED;
   }
   if (options.source === 'offline') {
     add('index', null, W.systemOffline);
-    return false;
+    return REACHED;
   }
-  const { unreachable, byTitle } = await systemEntries('index', file.indexRecord, options, add);
-  if (unreachable || !byTitle) return unreachable;
+  const { reach, byTitle } = await systemEntries('index', file.indexRecord, options, add);
+  if (reach.notRead || !byTitle) return reach;
   for (const record of file.records) {
     const joined = byTitle.get(`Record ${record.record} joined`);
     const expected = payloadDigestV1({
@@ -361,34 +375,34 @@ async function indexRecord(file: SharedRecordEvidenceV1, options: EvidenceOption
     const removedOk = !record.removed || byTitle.has(`Record ${record.record} removed`);
     if (!joined || !isDeepStrictEqual(joined['/payloads/0'], expected) || !removedOk) {
       add('index', false, W.indexDiffers(record.record));
-      return false;
+      return REACHED;
     }
   }
   add('index', true, W.indexMatches(file.records.length));
-  return false;
+  return REACHED;
 }
 
 /** When the file holds the link's own record: each acknowledgment it holds whole is the one that record committed. */
-async function readerRecord(file: SharedRecordEvidenceV1, held: Map<string, unknown>, options: EvidenceOptions, add: Add): Promise<boolean> {
+async function readerRecord(file: SharedRecordEvidenceV1, held: Map<string, unknown>, options: EvidenceOptions, add: Add): Promise<Reach> {
   if (!file.readerRecord) {
     add('reader', null, W.readerNotHeld);
-    return false;
+    return REACHED;
   }
   if (options.source === 'offline') {
     if (!file.indexRecord) add('reader', null, W.systemOffline);
-    return false;
+    return REACHED;
   }
-  const { unreachable, byTitle } = await systemEntries('reader', file.readerRecord, options, add);
-  if (unreachable || !byTitle) return unreachable;
+  const { reach, byTitle } = await systemEntries('reader', file.readerRecord, options, add);
+  if (reach.notRead || !byTitle) return reach;
   for (const [ref, body] of held) {
     const entry = byTitle.get(`Acknowledgment ${ref}`);
     if (!entry || !isDeepStrictEqual(entry['/payloads/0'], payloadDigestV1(body))) {
       add('reader', false, W.readerDiffers(ref));
-      return false;
+      return REACHED;
     }
   }
   add('reader', true, W.readerMatches(held.size));
-  return false;
+  return REACHED;
 }
 
 /** A listed `{pointer: value}` map against the fields a disclosure showed, exactly. */

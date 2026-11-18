@@ -14,6 +14,7 @@ export * from '../../shared/src/records/record-seal-history-v1';
 export * from '../../shared/src/records/record-link-copy-v1';
 export * from '../../shared/src/records/layouts';
 export * from '../../shared/src/records/inspect-record-calldata-v1';
+export * from '../../shared/src/records/ledger-write-search-v1';
 export * from '../../shared/src/demo/independent-verify-records';
 export * from '../../shared/src/demo/mirror-node-record-chain-reader';
 export * from '../../shared/src/proof/semantic-receipt-v2';

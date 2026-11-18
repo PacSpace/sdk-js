@@ -4,6 +4,9 @@
  * slice's report; their verbs are the Shared Record page's ("Matches its seal", "Does not match its seal",
  * "committed", "Checked").
  */
+import type { MirrorRefusalCode } from '@pacspace/shared';
+import { SOURCE_REFUSAL_REASONS } from '../report';
+
 const entriesWord = (n: number) => (n === 1 ? 'entry' : 'entries');
 const list = (items: ReadonlyArray<string | number>) =>
   items.length === 1 ? String(items[0]) : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
@@ -43,6 +46,7 @@ export const EVIDENCE_WORDS = {
   systemOffline: "The index record and the link's own record are checked against the proof layer, so they were not checked (--offline).",
   systemDiffers: (which: 'index' | 'reader') => `${which === 'index' ? "The index record's" : "The link's own record's"} seals do not match what was committed.`,
   unreachable: 'The proof layer could not be reached. Check again to try once more.',
+  refused: (code: MirrorRefusalCode) => `The proof layer was not read: ${SOURCE_REFUSAL_REASONS[code]}.`,
   boundary: 'The check shows what was committed and that it is unchanged. It does not show that what was recorded was true.',
 } as const;
 

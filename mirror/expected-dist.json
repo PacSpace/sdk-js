@@ -1,10 +1,10 @@
 {
   "schema": "pacspace-npm-mirror-dist/v1",
-  "sourceCommit": "0e67d9706264f582712ded2803a87ccf396cd2e8",
+  "sourceCommit": "536bc3bf1a089a9ed630123fc1fe85a69ec87fed",
   "packages": {
     "packages/sdk": {
       "name": "@pacspace-io/sdk",
-      "version": "0.15.1",
+      "version": "0.15.2",
       "files": {
         "blinding-file.d.ts": "1b8b0459aceae79d2d54e45480a89fa2acb1cf01c9d4e3396654e4e37362dc35",
         "blinding-file.d.ts.map": "405998b660ece0457faabe1d503401a23b447783e2b9027c53fb82ceae15d7fc",
@@ -20,9 +20,9 @@
         "fingerprint.d.ts.map": "86c57fd4208ac7bd375a486043a6464e9b515e1a6ec4de107a89b3bd90e44877",
         "index.d.ts": "0b7b61f937ef0d4afa2b7172ffc39bb0f1263a2230b16a9ce424113f705a9c59",
         "index.d.ts.map": "c7199b93dc8c1f42b26b9c4ae33262179af55b2fa4ce66b77356fba092f49d02",
-        "index.js": "c18e44ec83bc42a9de845772a34f97ad10916154a9281227bc916c12d4f4889c",
-        "index.js.map": "7ab773563c9c93c5528fba03c0956d7aa99fb00143553a3d2a8349fef84a9a8b",
-        "inputs.txt": "1946d3e21ba332ff55d548c7858f72a727365ad8dafeca9aad5ff19b061bb42d",
+        "index.js": "0e259d22f725174edebbdc006f193577f61a5073c583a6294fe7bffc78e0adf7",
+        "index.js.map": "257a8bdc3d9dedde623c7eada3a68c512877fea438eb2cd7480b0ba3a2aeefd4",
+        "inputs.txt": "90940023c7a91f8bbf67fc77ba27c4dff66c21b7a210a9667acc97b469f08bfe",
         "records-crypto-libraries.json": "ffd81dfd89fa70795b1a045963c9b917b3ea437d5a010e2ed3810481f1db785b",
         "records-crypto-types/proof/hiding-commitment-v1.d.ts": "d52bb6cad30ff27097913a5fd8c546f12b6f622434f8b95c24bfd07ad55e6373",
         "records-crypto-types/proof/jcs.d.ts": "ad732f0c3b43288697e7ff9f70c408e3ef136c2d4c7063b5099858a71e899fff",
@@ -114,18 +114,18 @@
     },
     "packages/check": {
       "name": "@pacspace-io/check",
-      "version": "0.5.0",
+      "version": "0.5.5",
       "files": {
-        "check.d.ts": "88cb4b473756403517fc165719ed36c0e11f5b70ab5aff6fe54a2ba6a9e2d1eb",
-        "cli.d.ts": "f9f518479b3404bd2818251be9acdee9dc9783300ee9a779cc7a1481d82d6ad1",
-        "cli.js": "b19785032346c0e0266b41cde3f39b78cddb06f3624e698aff94c0eb8673cc8f",
+        "check.d.ts": "c2fbc7e862929a86bc5d526cabef4e16a84a207a14c0e1f71bee465d1d8c397e",
+        "cli.d.ts": "ad8d43f7823d472ad98c6aa893593f938475e1461ef6ac39cc9da7ae15dc1d47",
+        "cli.js": "3523b7f8e96a3d57ca14a4c7e08c30cddbe10c904f464cf01a1ce7dff8f08c1f",
         "evidence/device-signature.d.ts": "5e7e452f9fc2c70d78350c81deac695d6ec7d9e2527f112abb6fb4d58934ef99",
         "evidence/equal.d.ts": "6f6d19b9a8d346f38188cdbde888d7a829a52efc6a1697a86e287b71ab3f9405",
-        "evidence/evidence.d.ts": "979f4efdb957603e807a1126bf1bc62a84d5de613ffbe51b19bb5c93f7462705",
-        "evidence/words.d.ts": "da232a483c2157a8318db2a03c76198c1bf1cdadbf310d3e8adc56de9cf2d66d",
-        "index.d.ts": "afa4d764275cec123b84ad917914ada2614b850eb15b36c18814f0d92e787672",
-        "index.js": "a51cdf168c2e7e586efef65ef3144f0cb5e023fffcf3f40a5273b6c9e71fd278",
-        "inputs.txt": "aa414a1a34ce2d3831f325d06befdd3cb071b42b82386f2fdfd3788656ec453d",
+        "evidence/evidence.d.ts": "0c7153fc0b845bac2e9bd761028e9171b84735f98bccceeffca01f0a7b88a704",
+        "evidence/words.d.ts": "f5e44764d9aefbba8891e5419dc1813da7590424615c8710fb05fb66fff47ae7",
+        "index.d.ts": "7011295b77c678669e29bbea19b998e7e0db52a38ba97d755b49f45e5ce44747",
+        "index.js": "6bc3cb1a37a7ed9e7c0cfd2f9ee08b5bf2ae37bad109671bfe7246b6c16b06cc",
+        "inputs.txt": "8f42a1ea632870d7627df68abcad6e8006bceb54e3fe03a955161b22e1bc9713",
         "open.d.ts": "8388331a49aff1b159be690f43b61cd58d3a30d005d06d27a0b280429bcf38b3",
         "records-crypto-libraries.json": "ffd81dfd89fa70795b1a045963c9b917b3ea437d5a010e2ed3810481f1db785b",
         "records-crypto-types/proof/hiding-commitment-v1.d.ts": "d52bb6cad30ff27097913a5fd8c546f12b6f622434f8b95c24bfd07ad55e6373",
@@ -169,9 +169,10 @@
         "records-crypto-types/records/trail-rule.d.ts": "cbe9547cbd90dfbc581478029c8e54890a94c2d94cd881ed98e8daa448a97708",
         "records-crypto.d.ts": "539d9127fff1e3f6a3113895798b649c9521874a4171af22ca0e6495ce30ce20",
         "records-crypto.js": "5aa15e18ada16b4c83beeb5a5e1cc4203900c9ad5a385356e3b119ccdab9694a",
-        "release.d.ts": "94090f38cb9549bace094f197d4950073179f5ee3c410c138e87b1ea7b1c5d12",
-        "report.d.ts": "6c956985a0523600c848db2244f7a2710e2102db5cc40d82ec11de722d1f8ca0",
-        "sample/sample.d.ts": "5e2da97357f7ed8e9541534448807530095104152598e4d85fe8398c618aec54"
+        "release.d.ts": "cf7169cfa17b0538084ccceeebfdf9d232846c640c3eeccf05b5ef493c6a950b",
+        "report.d.ts": "a6f1b8dfc5238eb540a22877a0d0d11e116847cf7ce0d17dc7187c04470a0275",
+        "sample/sample.d.ts": "5e2da97357f7ed8e9541534448807530095104152598e4d85fe8398c618aec54",
+        "writes.d.ts": "9b65b7c4d9bab53b55458a5b9c5c61f7b45fe1dfe5aad8366bc49c62e8bf4f9e"
       }
     }
   }
