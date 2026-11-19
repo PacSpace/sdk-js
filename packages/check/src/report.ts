@@ -22,6 +22,8 @@ export const SOURCE_REFUSAL_REASONS: Record<MirrorRefusalCode, string> = {
   'too-large': 'its source gave an answer larger than this checker reads',
   'too-many-logs': 'its source returned a longer page than was asked for',
   'next-page': 'its source pointed somewhere else for the next page',
+  'too-slow': 'its source did not finish answering in the time allowed',
+  'too-long': 'it holds more than this checker reads in one run',
 };
 
 export type SourceOutcome =
@@ -117,7 +119,11 @@ export interface CheckReport {
     /** Entry numbers (1-based) that do not match what was committed. */
     unmatched: number[];
   };
-  /** True when every entry the record has is in the file and matches what was committed. */
+  /**
+   * True only when this report's `exitCode` is 0: the check passed as asked. False when the proof layer was not
+   * read (exit code 3) and when anything asked for did not match (exit code 1): an entry, the proof layer, a
+   * daily statement under `--full`, the statement fingerprint given, or the file you hold.
+   */
   passed: boolean;
   file: {
     /** The history's fingerprint as the file carries it, or as recomputed when the file carries none. */
@@ -440,7 +446,24 @@ function heldFileField(held: HeldFileOutcome | null | undefined): CheckReport['h
   return held ? { matched: held.matched, entries: held.entries, blinded: held.blinded } : undefined;
 }
 
+/**
+ * A report with the narrower fact the checker's own commands read: whether every entry the record has is in the
+ * file and matches what was committed, and the proof layer, where it was compared, agrees. It says nothing of a
+ * daily statement, a statement fingerprint or a held file, and it is true beside a proof layer that was not read.
+ * Internal: `release`, `evidence` and the lookup of where entries were committed read `entriesMatch`; the
+ * package exports only the report, whose `passed` follows its exit code.
+ */
+export interface ReportWithFacts {
+  report: CheckReport;
+  entriesMatch: boolean;
+}
+
 export function buildReport(input: ReportInput): CheckReport {
+  return buildReportWithFacts(input).report;
+}
+
+/** Internal; see `ReportWithFacts`. */
+export function buildReportWithFacts(input: ReportInput): ReportWithFacts {
   const history = input.verification.history;
   const matched = history?.verifiedRecords ?? 0;
   const entries = history?.expectedRecords ?? (history ? matched : null);
@@ -458,7 +481,7 @@ export function buildReport(input: ReportInput): CheckReport {
     exportedAt: input.exportedAt,
   };
   const statementFingerprint = statementFingerprintOf(input.statementFingerprint, intact, file.fingerprint);
-  const passed = input.verification.verified && (input.source.compared ? input.source.matches : true);
+  const entriesMatch = input.verification.verified && (input.source.compared ? input.source.matches : true);
 
   const sentences: string[] = [];
   if (!intact) {
@@ -480,7 +503,7 @@ export function buildReport(input: ReportInput): CheckReport {
 
   // Only --full, which reads the proof layer's daily statements, can find that the file's statement does not match. Then the check as asked did not pass.
   const failed =
-    !passed ||
+    !entriesMatch ||
     input.dailyStatement?.matches === false ||
     (statementFingerprint !== null && !statementFingerprint.matches) ||
     (!!input.heldFile && !input.heldFile.matched);
@@ -488,12 +511,12 @@ export function buildReport(input: ReportInput): CheckReport {
   const exitCode = exitCodeOf(unreachable, failed);
   if (closesWithBoundary(exitCode)) sentences.push(HONESTY_SENTENCE);
 
-  return {
+  const report: CheckReport = {
     schema: REPORT_SCHEMA,
     checker: input.checker,
     ...(input.form ? { form: input.form } : {}),
     record,
-    passed,
+    passed: exitCode === 0,
     file,
     source: input.source,
     dailyStatement: input.dailyStatement,
@@ -503,6 +526,7 @@ export function buildReport(input: ReportInput): CheckReport {
     sentences,
     exitCode,
   };
+  return { report, entriesMatch };
 }
 
 export interface SealsReportInput {
@@ -524,6 +548,11 @@ export interface SealsReportInput {
 
 /** A seal history's report, alone or in a kept copy, with any disclosure checked against it. */
 export function buildSealsReport(input: SealsReportInput): CheckReport {
+  return buildSealsReportWithFacts(input).report;
+}
+
+/** Internal; see `ReportWithFacts`. Here `entriesMatch` also needs any disclosure to have verified. */
+export function buildSealsReportWithFacts(input: SealsReportInput): ReportWithFacts {
   const v = input.verification;
   const failedCount = v.failedSeq.length;
   const record: CheckReport['record'] = {
@@ -539,7 +568,7 @@ export function buildSealsReport(input: SealsReportInput): CheckReport {
   const verdict = sealsVerdict(input.entries, v, input.queued);
   const disclosure = input.disclosure;
   const disclosureOk = !disclosure || disclosure.kind === 'verified';
-  const passed = verdict.passed && v.verified && (input.source.compared ? input.source.matches : true) && disclosureOk;
+  const entriesMatch = verdict.passed && v.verified && (input.source.compared ? input.source.matches : true) && disclosureOk;
 
   const sentences: string[] = [intact ? verdict.sentence : FILE_CHANGED_SENTENCE];
   if (disclosure?.kind === 'verified') {
@@ -556,18 +585,18 @@ export function buildSealsReport(input: SealsReportInput): CheckReport {
   if (input.heldFile && disclosure?.kind === 'verified') sentences.push(...heldFileSentences(input.heldFile));
 
   const failed =
-    !passed || (statementFingerprint !== null && !statementFingerprint.matches) || (!!input.heldFile && !input.heldFile.matched);
+    !entriesMatch || (statementFingerprint !== null && !statementFingerprint.matches) || (!!input.heldFile && !input.heldFile.matched);
   const unreachable =
     (!input.source.compared && input.source.reason === 'unreachable') || disclosure?.kind === 'root-not-read';
   const exitCode = exitCodeOf(unreachable, failed);
   if (closesWithBoundary(exitCode)) sentences.push(SEALS_BOUNDARY_SENTENCE);
 
-  return {
+  const report: CheckReport = {
     schema: REPORT_SCHEMA,
     checker: input.checker,
     form: input.form,
     record,
-    passed,
+    passed: exitCode === 0,
     file,
     source: input.source,
     dailyStatement: null,
@@ -578,6 +607,7 @@ export function buildSealsReport(input: SealsReportInput): CheckReport {
     sentences,
     exitCode,
   };
+  return { report, entriesMatch };
 }
 
 export const WRITES_HEADING = 'Where each entry was committed on the proof layer:';

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.3 - 2026-11-18
+
+### Security
+
+- Reads over JSON-RPC (a `source` that names an RPC endpoint) hold the endpoint to its own address: a redirect is not followed. An answer larger than 1 MiB is not read, and a 429 is never waited on longer than the timeout. With such a source `records.check()` answers `sourceChecked: false`, and `records.open()` and `records.disclose()` refuse with `DISCLOSURE_CHAIN_ROOT_MISSING`, as they do for a source that cannot be reached.
+
 ## 0.15.2 - 2026-11-17
 
 ### Security

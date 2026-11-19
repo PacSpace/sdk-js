@@ -21,7 +21,7 @@ import {
 } from '@pacspace/shared';
 import { isDeepStrictEqual } from './equal';
 import { loadDeviceSignature } from './device-signature';
-import { CHECKER_NAME, CHECKER_VERSION, checkCommittedEntries, checkHistory, type CheckOptions, type RevealedEntry } from '../check';
+import { CHECKER_NAME, CHECKER_VERSION, checkCommittedEntries, checkHistoryWithFacts, type CheckOptions, type RevealedEntry } from '../check';
 import { refusedOf, type CheckReport } from '../report';
 import { EVIDENCE_WORDS as W } from './words';
 
@@ -116,11 +116,11 @@ export async function checkEvidence(file: SharedRecordEvidenceV1, options: Evide
 
   const closeFailed: number[] = [];
   for (const record of file.records) {
-    const report = await checkHistory(record.sealHistory as never, options);
+    const { report, entriesMatch } = await checkHistoryWithFacts(record.sealHistory as never, options);
     reach = both(reach, reachOf(report));
     const sealsAgree = record.seals.length === record.entries && record.sealHistory.entries.length === record.entries && record.seals.every((s, i) => hex(s) === hex(record.sealHistory.entries[i]?.seal));
-    if (options.source === 'offline') add(`record ${record.record}`, report.passed && sealsAgree ? null : false, report.passed && sealsAgree ? W.recordOffline(record.record) : W.recordDiffers(record.record));
-    else if (report.exitCode !== 3) add(`record ${record.record}`, report.passed && sealsAgree, report.passed && sealsAgree ? W.recordMatches(record.record, record.entries) : W.recordDiffers(record.record));
+    if (options.source === 'offline') add(`record ${record.record}`, entriesMatch && sealsAgree ? null : false, entriesMatch && sealsAgree ? W.recordOffline(record.record) : W.recordDiffers(record.record));
+    else if (report.exitCode !== 3) add(`record ${record.record}`, entriesMatch && sealsAgree, entriesMatch && sealsAgree ? W.recordMatches(record.record, record.entries) : W.recordDiffers(record.record));
     const last = record.sealHistory.entries[record.sealHistory.entries.length - 1];
     if (!last || last.seq !== record.close.lastSeq || hex(last.seal) !== hex(record.close.lastSeal) || record.close.lastSeq + 1 !== record.entries) closeFailed.push(record.record);
   }
@@ -188,9 +188,9 @@ async function revealedAndAnswered(file: SharedRecordEvidenceV1, options: Eviden
   let reach = REACHED;
   const open = async (record: EvidenceRecordV1, disclosure: unknown) => {
     const revealed: RevealedEntry[] = [];
-    const report = await checkHistory(disclosure as never, { ...options, history: record.sealHistory as never, onRevealed: (entries) => revealed.push(...entries) });
+    const { report, entriesMatch } = await checkHistoryWithFacts(disclosure as never, { ...options, history: record.sealHistory as never, onRevealed: (entries) => revealed.push(...entries) });
     reach = both(reach, reachOf(report));
-    return { passed: report.passed, unreachable: report.exitCode === 3, revealed };
+    return { passed: entriesMatch, unreachable: report.exitCode === 3, revealed };
   };
   for (const record of file.records) {
     if (record.disclosure === undefined) continue;

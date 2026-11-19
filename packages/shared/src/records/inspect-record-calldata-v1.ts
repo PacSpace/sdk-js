@@ -34,6 +34,7 @@ import {
   type SemanticReceiptV6,
 } from './record-history-bundle-v3';
 import { getPublishedLayoutRegistry } from './layouts';
+import { isMirrorRedirect, MIRROR_ANSWER_MAX_BYTES, mirrorRefusal, mirrorRefusalOf, readMirrorJson } from './ledger-write-search-v1';
 
 /** Public mirror nodes by chain id; never a PacSpace endpoint. */
 export const MIRROR_NODE_BY_CHAIN: Readonly<Record<number, string>> = Object.freeze({
@@ -311,11 +312,22 @@ export interface ReadMirrorTransactionOptions {
   mirror?: string | null;
   fetchImpl?: typeof fetch;
   attempts?: number;
+  /** The time one attempt is given, milliseconds. */
+  timeoutMs?: number;
 }
+
+/** The time one attempt of the calldata read is given unless the caller names another. */
+export const MIRROR_TRANSACTION_READ_TIMEOUT_MS = 10_000;
 
 /**
  * Transaction input and result facts from a public mirror node; never PacSpace.
  * Browser-safe: uses the global `fetch` unless one is supplied.
+ *
+ * The mirror is held as every other mirror read is: a redirect is not
+ * followed, the answer is read no further than `MIRROR_ANSWER_MAX_BYTES`,
+ * and each attempt ends at its timeout. A redirect or an answer over the
+ * limit is a `MirrorAnswerRefused`, thrown at once like "not found": asking
+ * again would not change it.
  */
 export async function readTransactionInputFromMirror(
   txHash: string,
@@ -328,20 +340,38 @@ export async function readTransactionInputFromMirror(
   if (!/^0x[0-9a-f]{64}$/.test(hash)) throw new Error('txHash must be a 0x-prefixed 32-byte transaction hash');
   const fetchImpl = options.fetchImpl ?? fetch;
   const attempts = Math.max(1, options.attempts ?? 3);
-  const url = new URL(`/api/v1/contracts/results/${hash}`, base).toString();
+  const timeoutMs = Math.max(1, options.timeoutMs ?? MIRROR_TRANSACTION_READ_TIMEOUT_MS);
+  const path = `/api/v1/contracts/results/${hash}`;
+  const url = new URL(path, base).toString();
   let lastError: unknown;
   let result: Record<string, unknown> | null = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetchImpl(url, { headers: { accept: 'application/json' } });
-      if (res.status === 404) throw new Error('contract-result lookup: not found (is the hash right and on this chain?)');
-      if (!res.ok) throw new Error(`contract-result lookup: HTTP ${res.status}`);
-      result = (await res.json()) as Record<string, unknown>;
+      const res = await fetchImpl(url, { headers: { accept: 'application/json' }, redirect: 'manual', signal: controller.signal });
+      if (isMirrorRedirect(res)) {
+        await res.body?.cancel?.().catch(() => undefined);
+        throw mirrorRefusal.redirect(path);
+      }
+      if (res.status === 404) {
+        await res.body?.cancel?.().catch(() => undefined);
+        throw new Error('contract-result lookup: not found (is the hash right and on this chain?)');
+      }
+      if (!res.ok) {
+        await res.body?.cancel?.().catch(() => undefined);
+        throw new Error(`contract-result lookup: HTTP ${res.status}`);
+      }
+      result = (await readMirrorJson(res, MIRROR_ANSWER_MAX_BYTES, path)) as Record<string, unknown>;
       break;
     } catch (error) {
-      lastError = error;
+      // A refused answer is the source's own doing, and a hash the mirror does not know stays unknown: neither is asked again.
+      if (mirrorRefusalOf(error)) throw error;
       if (String((error as Error)?.message).includes('not found')) throw error;
+      lastError = controller.signal.aborted ? new Error(`contract-result lookup: timed out after ${timeoutMs}ms`) : error;
       if (attempt < attempts) await new Promise((r) => setTimeout(r, 400 * attempt));
+    } finally {
+      clearTimeout(timer);
     }
   }
   if (!result) throw new Error(`contract-result lookup failed after ${attempts} attempts: ${(lastError as Error)?.message ?? lastError}`);
