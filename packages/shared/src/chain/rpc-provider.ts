@@ -175,16 +175,52 @@ export function redactRpcError(error: unknown, secrets: readonly string[]): Erro
 export type RpcProviderOptions = JsonRpcApiProviderOptions & {
   /** The HTTP request timeout in milliseconds (ethers' `FetchRequest.timeout`, 300 s by default). */
   timeoutMs?: number;
+  /**
+   * Called once with the provider's request before anything is sent, to set how it is sent and retried
+   * (`holdRpcRequest`, for a reader pointed at an endpoint someone else chose). Without it the request is
+   * ethers' own, as the API, the worker and the indexer use it.
+   */
+  prepareRequest?: (request: FetchRequest) => void;
 };
+
+function requestFor(url: string, options: Pick<RpcProviderOptions, "timeoutMs" | "prepareRequest">): FetchRequest {
+  const request = new FetchRequest(url);
+  if (options.timeoutMs !== undefined) request.timeout = options.timeoutMs;
+  options.prepareRequest?.(request);
+  return request;
+}
+
+const CHAIN_ID_RESULT = /^0x[0-9a-f]{1,13}$/i;
+
+/**
+ * The endpoint's chain id, asked once with the same request a provider built with these options would send, so
+ * the same sender, timeout and retry hold. For a reader that must give ethers a fixed network: without one,
+ * ethers asks by itself, again every second for as long as the endpoint fails, and prints a line each time.
+ * Errors pass through `redactRpcError`, so no part of the address reaches the caller.
+ */
+export async function readRpcChainId(url: string, options: Pick<RpcProviderOptions, "timeoutMs" | "prepareRequest"> = {}): Promise<number> {
+  const secrets = rpcUrlSecrets(url);
+  try {
+    const request = requestFor(url, options);
+    request.body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] });
+    request.setHeader("content-type", "application/json");
+    const response = await request.send();
+    response.assertOk();
+    const answer = response.bodyJson as { result?: unknown } | null;
+    const result = answer !== null && typeof answer === "object" ? answer.result : undefined;
+    if (typeof result !== "string" || !CHAIN_ID_RESULT.test(result)) throw new Error("eth_chainId from the RPC is incomplete: not a chain id");
+    return Number.parseInt(result, 16);
+  } catch (error) {
+    throw redactRpcError(error, secrets);
+  }
+}
 
 class RedactingJsonRpcProvider extends JsonRpcProvider {
   readonly #secrets: readonly string[];
 
   constructor(url: string, network: Networkish | undefined, options: RpcProviderOptions) {
-    const { timeoutMs, ...providerOptions } = options;
-    const request = new FetchRequest(url);
-    if (timeoutMs !== undefined) request.timeout = timeoutMs;
-    super(request, network, providerOptions);
+    const { timeoutMs, prepareRequest, ...providerOptions } = options;
+    super(requestFor(url, { timeoutMs, prepareRequest }), network, providerOptions);
     this.#secrets = rpcUrlSecrets(url);
   }
 

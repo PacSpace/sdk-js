@@ -1,5 +1,6 @@
 import { ethers } from 'ethers';
-import { createRpcProvider } from '../chain/rpc-provider';
+import { holdRpcRequest } from '../chain/rpc-guarded-send';
+import { createRpcProvider, readRpcChainId } from '../chain/rpc-provider';
 import { DecodedState } from '../proof/layout-document-v1';
 import { LedgerBatchRef } from '../proof/ledger-head-v1';
 import { normalizeProofHash } from '../proof/merkle-v2';
@@ -14,6 +15,14 @@ import {
 } from '../proof/semantic-receipt-v2';
 import { LayoutRegistry, decodeWordV1, hex256 } from '../proof/slot-encoding-v1';
 import { getPublishedLayoutRegistry } from '../records/layouts';
+import {
+  KEPT_LOG_DATA_MAX_CHARS,
+  KEPT_LOG_MAX_TOPICS,
+  LOG_SCAN_BUDGET_TIMEOUTS,
+  LOG_SCAN_MAX_KEPT_LOGS,
+  mirrorRefusalOf,
+  rpcRefusal,
+} from '../records/ledger-write-search-v1';
 import {
   BundleVerificationV1,
   RecordHistoryBundleV1,
@@ -147,6 +156,8 @@ export interface RpcReaderOptions {
   timeoutMs?: number;
   /** Max block span per eth_getLogs call (Hedera relays cap the range). */
   logsChunkSize?: number;
+  /** Test seams for a whole scan's stops: its clock and the most logs it keeps. */
+  scan?: { now?: () => number; maxKeptLogs?: number };
 }
 
 function normalizeRpcUrl(url: string): string {
@@ -156,10 +167,13 @@ function normalizeRpcUrl(url: string): string {
   return trimmed;
 }
 
+/** A read that was cut off by `withTimeout`. */
+class ReadTimedOut extends Error {}
+
 async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer = setTimeout(() => reject(new ReadTimedOut(`${label} timed out after ${ms}ms`)), ms);
   });
   try {
     return await Promise.race([p, timeout]);
@@ -168,30 +182,109 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
   }
 }
 
+/**
+ * A `RecordChainReader` over a JSON-RPC endpoint the caller names. The
+ * endpoint is held to its own address, its answers to a size and its waits
+ * to an end (`holdRpcRequest`): a redirect is not followed, no answer is read
+ * past 1 MiB, a 429 is tried three times at most, and every request ends at
+ * the timeout. ethers is always given a fixed network; when the caller names
+ * no chain id the endpoint is asked for it once, so ethers never starts its
+ * own search for the network, which has no end against an endpoint that fails.
+ *
+ * A whole scan of the contract's log (`getLedgerAdvances`, `getRecordWrites`)
+ * goes through the chain from `fromBlock` a range at a time. It is given
+ * sixty request timeouts in all, keeps only this contract's logs of the
+ * event asked for at that event's fixed size, and stops at a million of
+ * them. A range whose answer is over the size limit is asked again in halves,
+ * down to one block.
+ */
 export function createRpcRecordChainReader(options: RpcReaderOptions): RecordChainReader {
   const rpcUrl = normalizeRpcUrl(options.rpcUrl);
   if (!rpcUrl) throw new Error('rpcUrl is required.');
   const contractAddress = ethers.getAddress(options.contractAddress).toLowerCase();
   const timeoutMs = Number(options.timeoutMs || 10000);
   const chunk = Math.max(1, Number(options.logsChunkSize || 2000));
-  const network = options.chainId != null ? new ethers.Network(`chain-${options.chainId}`, options.chainId) : undefined;
-  const provider = network
-    ? createRpcProvider(rpcUrl, network, { staticNetwork: network })
-    : createRpcProvider(rpcUrl);
-  const contract = new ethers.Contract(contractAddress, RECORD_LANE_ABI_V38 as unknown as string[], provider);
+  const now = options.scan?.now ?? Date.now;
+  const maxKeptLogs = options.scan?.maxKeptLogs ?? LOG_SCAN_MAX_KEPT_LOGS;
   const iface = new ethers.Interface(RECORD_LANE_ABI_V38 as unknown as string[]);
+  const prepareRequest = (request: ethers.FetchRequest) => holdRpcRequest(request);
+
+  interface Endpoint {
+    provider: ethers.JsonRpcProvider;
+    contract: ethers.Contract;
+  }
+  const endpointFor = (chainId: number): Endpoint => {
+    const network = new ethers.Network(`chain-${chainId}`, chainId);
+    const provider = createRpcProvider(rpcUrl, network, { staticNetwork: network, timeoutMs, prepareRequest });
+    return { provider, contract: new ethers.Contract(contractAddress, RECORD_LANE_ABI_V38 as unknown as string[], provider) };
+  };
+  let ready: Promise<Endpoint> | null = options.chainId != null ? Promise.resolve(endpointFor(options.chainId)) : null;
+  /** The provider, built once. Without a chain id the endpoint is asked for it first: concurrent first calls share that one request, and a failure is not kept. */
+  function endpoint(): Promise<Endpoint> {
+    if (!ready) {
+      const pending = readRpcChainId(rpcUrl, { timeoutMs, prepareRequest }).then(endpointFor);
+      ready = pending;
+      pending.catch(() => {
+        if (ready === pending) ready = null;
+      });
+    }
+    return ready;
+  }
+
+  /** Whether a log of the scan is kept: this contract's, of the event asked for, and no longer than that event is. */
+  function keptLog(log: ethers.Log, topic0: string): boolean {
+    return (
+      String(log.address).toLowerCase() === contractAddress &&
+      log.topics.length <= KEPT_LOG_MAX_TOPICS &&
+      String(log.topics[0] ?? '').toLowerCase() === topic0 &&
+      typeof log.data === 'string' &&
+      log.data.length <= KEPT_LOG_DATA_MAX_CHARS
+    );
+  }
 
   async function scanLogs(topics: Array<string | null>, fromBlock: number, toBlock: number | 'latest', label: string): Promise<ethers.Log[]> {
-    const latest = toBlock === 'latest' ? await withTimeout(provider.getBlockNumber(), timeoutMs, 'getBlockNumber') : toBlock;
+    const { provider } = await endpoint();
+    const budgetMs = LOG_SCAN_BUDGET_TIMEOUTS * timeoutMs;
+    const deadline = now() + budgetMs;
+    const topic0 = String(topics[0] ?? '').toLowerCase();
+    /** One request inside what is left of the scan's time, and no longer than a request's own timeout. */
+    const ask = async <T>(send: () => Promise<T>, what: string): Promise<T> => {
+      const left = deadline - now();
+      if (left <= 0) throw rpcRefusal.scanTooSlow(budgetMs);
+      const allowed = Math.min(timeoutMs, left);
+      try {
+        return await withTimeout(send(), allowed, what);
+      } catch (error) {
+        // Cut off by what was left of the scan's time, not by a request's own timeout: the scan is over.
+        if (error instanceof ReadTimedOut && allowed < timeoutMs) throw rpcRefusal.scanTooSlow(budgetMs);
+        if (!mirrorRefusalOf(error) && now() >= deadline) throw rpcRefusal.scanTooSlow(budgetMs);
+        throw error;
+      }
+    };
+    const latest = toBlock === 'latest' ? await ask(() => provider.getBlockNumber(), 'getBlockNumber') : toBlock;
     const out: ethers.Log[] = [];
+    // Ranges still to ask, the next one last. A range over the size limit is put back as its two halves.
+    const pending: Array<[number, number]> = [];
     for (let start = fromBlock; start <= latest; start += chunk) {
-      const end = Math.min(latest, start + chunk - 1);
-      const logs = await withTimeout(
-        provider.getLogs({ address: contractAddress, topics, fromBlock: start, toBlock: end }),
-        timeoutMs,
-        `getLogs ${label} (${start}-${end})`,
-      );
-      out.push(...logs);
+      pending.push([start, Math.min(latest, start + chunk - 1)]);
+      while (pending.length > 0) {
+        const [from, to] = pending.pop() as [number, number];
+        let logs: ethers.Log[];
+        try {
+          logs = await ask(() => provider.getLogs({ address: contractAddress, topics, fromBlock: from, toBlock: to }), `getLogs ${label} (${from}-${to})`);
+        } catch (error) {
+          // One block whose logs are over the limit is refused; a wider range is asked again in halves.
+          if (mirrorRefusalOf(error) !== 'too-large' || from >= to) throw error;
+          const middle = from + Math.floor((to - from) / 2);
+          pending.push([middle + 1, to], [from, middle]);
+          continue;
+        }
+        for (const log of logs) {
+          if (!keptLog(log, topic0)) continue;
+          if (out.length >= maxKeptLogs) throw rpcRefusal.scanTooManyLogs(maxKeptLogs);
+          out.push(log);
+        }
+      }
     }
     return out;
   }
@@ -200,10 +293,12 @@ export function createRpcRecordChainReader(options: RpcReaderOptions): RecordCha
     contractAddress,
     async getRecord(recordKey) {
       const key = normalizeProofHash(recordKey, 'recordKey');
+      const { contract } = await endpoint();
       const word = await withTimeout(contract.getRecord(key), timeoutMs, 'getRecord');
       return hex256(BigInt(word as bigint));
     },
     async getLayout(layoutId) {
+      const { contract } = await endpoint();
       const l = await withTimeout(contract.getLayout(layoutId), timeoutMs, 'getLayout');
       return {
         layoutDigest: String(l[0]).toLowerCase(),
@@ -213,10 +308,12 @@ export function createRpcRecordChainReader(options: RpcReaderOptions): RecordCha
       };
     },
     async getBatchRoot(batchId) {
+      const { contract } = await endpoint();
       const root = await withTimeout(contract.getBatchRoot(BigInt(batchId)), timeoutMs, 'getBatchRoot');
       return normalizeProofHash(String(root), 'observedProofRoot');
     },
     async getLedgerHead() {
+      const { contract } = await endpoint();
       const head = await withTimeout(contract.getLedgerHead(), timeoutMs, 'getLedgerHead');
       return normalizeProofHash(String(head), 'ledgerHead');
     },
@@ -282,6 +379,10 @@ export function createRpcRecordChainReader(options: RpcReaderOptions): RecordCha
       };
       const end = (ended: RecordWriteSearchResult['ended']): RecordWriteSearchResult => ({ writes, ended, requests });
       if (search.maxRequests < 1) return end('limit');
+      // The chain id, when the file named none, is read inside the budget and is not one of the search's requests.
+      const found = await within(endpoint());
+      if (found === CUT) return end('timeout');
+      const { provider } = found;
       requests += 1;
       const latest = await within(provider.getBlockNumber());
       if (latest === CUT) return end('timeout');

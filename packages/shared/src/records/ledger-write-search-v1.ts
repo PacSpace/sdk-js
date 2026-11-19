@@ -29,12 +29,27 @@ const HEX64 = /^0x[0-9a-f]{64}$/;
 const HEX_DATA = /^0x[0-9a-f]*$/;
 const TIMESTAMP = /^\d+(\.\d+)?$/;
 
-/** Why a mirror answer was not read. */
-export type MirrorRefusalCode = 'redirect' | 'too-large' | 'too-many-logs' | 'next-page';
+/**
+ * Why a source's answer, or its whole log, was not read. The first four are one answer's: a redirect, an answer over
+ * the size limit, a page longer than asked for, a next page that is somewhere else or does not follow the last.
+ * `too-slow` and `too-long` are a whole scan's: it did not finish in the time allowed, or it is longer than one run reads.
+ */
+export type MirrorRefusalCode = 'redirect' | 'too-large' | 'too-many-logs' | 'next-page' | 'too-slow' | 'too-long';
 
-const REFUSAL_CODES: readonly string[] = ['redirect', 'too-large', 'too-many-logs', 'next-page'];
+/** Keyed by the type, so a code added to it and not here does not compile; a code missing here would read as "could not be reached". */
+const REFUSAL_CODES: Record<MirrorRefusalCode, true> = {
+  redirect: true,
+  'too-large': true,
+  'too-many-logs': true,
+  'next-page': true,
+  'too-slow': true,
+  'too-long': true,
+};
 
-/** A mirror answered, and its answer was not read: a redirect, an answer over the size limit, a page longer than asked for, or a next page somewhere else. */
+/** Every refusal code, in the order above. */
+export const MIRROR_REFUSAL_CODES = Object.keys(REFUSAL_CODES) as MirrorRefusalCode[];
+
+/** A source answered, and its answer was not read; or its log was not read to the end. The code says which rule ended the read. */
 export class MirrorAnswerRefused extends Error {
   readonly code: MirrorRefusalCode;
 
@@ -49,7 +64,7 @@ export class MirrorAnswerRefused extends Error {
 export function mirrorRefusalOf(error: unknown): MirrorRefusalCode | null {
   if (!error || typeof error !== 'object') return null;
   const { name, code } = error as { name?: unknown; code?: unknown };
-  return name === 'MirrorAnswerRefused' && typeof code === 'string' && REFUSAL_CODES.includes(code) ? (code as MirrorRefusalCode) : null;
+  return name === 'MirrorAnswerRefused' && typeof code === 'string' && Object.prototype.hasOwnProperty.call(REFUSAL_CODES, code) ? (code as MirrorRefusalCode) : null;
 }
 
 /** A request path as a message names it: without its query. */
@@ -62,7 +77,34 @@ export const mirrorRefusal = {
   tooLarge: (maxBytes: number, path?: string) => new MirrorAnswerRefused('too-large', `mirror node answer is larger than ${maxBytes} bytes${pathLabel(path)}`),
   tooManyLogs: (asked: number, path?: string) => new MirrorAnswerRefused('too-many-logs', `mirror node returned more logs than the ${asked} asked for${pathLabel(path)}`),
   nextPage: () => new MirrorAnswerRefused('next-page', "mirror node gave a next page that is not this contract's log"),
+  /** A page whose logs do not come after the last log read. */
+  notForward: () => new MirrorAnswerRefused('next-page', 'mirror node gave a next page that does not follow the last'),
+  scanTooSlow: (budgetMs: number) => new MirrorAnswerRefused('too-slow', `mirror node log scan did not finish in ${budgetMs}ms`),
+  scanTooManyRequests: (requests: number) => new MirrorAnswerRefused('too-long', `mirror node log scan passed ${requests} requests`),
+  scanTooManyLogs: (logs: number) => new MirrorAnswerRefused('too-long', `mirror node log scan kept more than ${logs} logs`),
 } as const;
+
+/**
+ * The same rules for a JSON-RPC endpoint the reader was pointed at. The codes are the mirror's, so a report says the
+ * same thing of either kind of source; the messages name "RPC endpoint" and never its address.
+ */
+export const rpcRefusal = {
+  redirect: () => new MirrorAnswerRefused('redirect', 'RPC endpoint answered with a redirect, which is not followed'),
+  tooLarge: (maxBytes: number) => new MirrorAnswerRefused('too-large', `RPC endpoint answer is larger than ${maxBytes} bytes`),
+  scanTooSlow: (budgetMs: number) => new MirrorAnswerRefused('too-slow', `RPC log scan did not finish in ${budgetMs}ms`),
+  scanTooManyLogs: (logs: number) => new MirrorAnswerRefused('too-long', `RPC log scan kept more than ${logs} logs`),
+} as const;
+
+/** A whole scan of a contract's log is given this many request timeouts in all: ten minutes at the default timeout. */
+export const LOG_SCAN_BUDGET_TIMEOUTS = 60;
+/** A mirror scan asks at most this many times, counting a page asked again smaller. */
+export const LOG_SCAN_MAX_REQUESTS = 10_000;
+/** A scan keeps at most this many logs. A kept log is about 1 KB, so a scan holds about 1 GB at most. */
+export const LOG_SCAN_MAX_KEPT_LOGS = 1_000_000;
+/** The longest data a kept log carries: the three words of RecordWritten and of LedgerHeadAdvanced. */
+export const KEPT_LOG_DATA_MAX_CHARS = 2 + 64 * 3;
+/** The most topics a kept log carries: RecordWritten's three. */
+export const KEPT_LOG_MAX_TOPICS = 3;
 
 /**
  * Whether an answer is a redirect, in each form a runtime gives one: a 3xx

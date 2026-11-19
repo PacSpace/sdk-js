@@ -5,8 +5,13 @@ import { MIRROR_NODE_BY_CHAIN } from '../records/inspect-record-calldata-v1';
 import {
   contractLogPath,
   isMirrorRedirect,
+  KEPT_LOG_DATA_MAX_CHARS,
+  KEPT_LOG_MAX_TOPICS,
   LEDGER_WRITE_SEARCH_PAGE_LIMIT,
   ledgerWriteSearchPath,
+  LOG_SCAN_BUDGET_TIMEOUTS,
+  LOG_SCAN_MAX_KEPT_LOGS,
+  LOG_SCAN_MAX_REQUESTS,
   MIRROR_ANSWER_MAX_BYTES,
   mirrorRefusal,
   mirrorRefusalOf,
@@ -44,6 +49,13 @@ import {
  * asked for is not read, and a next page is read only from the same source
  * and this contract's log. Each of these ends the read with a
  * `MirrorAnswerRefused`, without a retry.
+ *
+ * A whole scan of the contract's log is bounded as well. It is given sixty
+ * request timeouts in all and each request no more than what is left; it
+ * asks at most 10,000 times, counting a page asked again smaller; it keeps
+ * at most a million logs; and every log must come after the last one read,
+ * by consensus timestamp and index, so a source cannot repeat a page or go
+ * back. A scan that stops is refused whole, never read as a shorter log.
  */
 export interface MirrorNodeReaderOptions {
   /** Mirror base URL; defaults from `chainId` through MIRROR_NODE_BY_CHAIN. */
@@ -61,6 +73,8 @@ export interface MirrorNodeReaderOptions {
    * history asks nothing more. Only for a reader made for one run.
    */
   keepLogPages?: boolean;
+  /** Test seams for a whole scan's stops: its clock, the most requests it makes and the most logs it keeps. */
+  scan?: { now?: () => number; maxRequests?: number; maxKeptLogs?: number };
 }
 
 /** Six days: a day inside the mirror's rule that a topic search span less than seven. */
@@ -86,25 +100,64 @@ interface MirrorLog {
   timestamp: string;
 }
 
+/** One scan's stops: when its time ends, and how many times it has asked. */
+interface ScanState {
+  deadline: number;
+  requests: number;
+}
+
 interface MirrorLogsPage {
   logs?: unknown;
   links?: { next?: unknown };
 }
 
 const KEPT_TOPICS: readonly string[] = [RECORD_WRITTEN_TOPIC.toLowerCase(), LEDGER_HEAD_ADVANCED_TOPIC.toLowerCase()];
+const HEX_DATA = /^0x[0-9a-fA-F]*$/;
+
+/** Where a log sits in the mirror's order: its consensus timestamp in nanoseconds, then its index. */
+export interface MirrorLogPosition {
+  nanos: bigint;
+  index: number;
+}
+
+/** A log's position, or null when its timestamp is not a consensus timestamp or its index is not a whole number. */
+export function mirrorLogPosition(raw: unknown): MirrorLogPosition | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const { timestamp, index } = raw as { timestamp?: unknown; index?: unknown };
+  if (typeof timestamp !== 'string' || !CONSENSUS_TIMESTAMP.test(timestamp)) return null;
+  if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0) return null;
+  const [seconds, fraction] = timestamp.split('.');
+  return { nanos: BigInt(seconds) * 1_000_000_000n + BigInt(fraction), index };
+}
+
+/** Whether `next` comes after `last` in the mirror's ascending order. */
+export function mirrorLogFollows(last: MirrorLogPosition | null, next: MirrorLogPosition): boolean {
+  return last === null || next.nanos > last.nanos || (next.nanos === last.nanos && next.index > last.index);
+}
 
 /**
  * A log of the scan as the reader keeps it: only the two events it reads
- * (RecordWritten, LedgerHeadAdvanced) and only the seven values it uses, so
+ * (RecordWritten, LedgerHeadAdvanced), only the seven values it uses, and
+ * only at those events' fixed size (three topics, three data words), so
  * what a history's scan holds in memory does not grow with what else the
- * contract's log carries. Any other log is null.
+ * contract's log carries or with what a source pads a log with. With
+ * `contract`, the log must also be that contract's and sit at a well formed
+ * position. Any other log is null.
  */
-export function keptMirrorLog(raw: unknown): MirrorLog | null {
+export function keptMirrorLog(raw: unknown, contract?: string): MirrorLog | null {
   if (!raw || typeof raw !== 'object') return null;
   const log = raw as Partial<Record<keyof MirrorLog, unknown>>;
   if (!Array.isArray(log.topics) || typeof log.data !== 'string') return null;
+  if (log.topics.length > KEPT_LOG_MAX_TOPICS || log.data.length > KEPT_LOG_DATA_MAX_CHARS || !HEX_DATA.test(log.data)) return null;
   const topics = log.topics.map((topic) => String(topic));
   if (!KEPT_TOPICS.includes((topics[0] ?? '').toLowerCase())) return null;
+  if (topics.some((topic) => topic.length > 66)) return null;
+  if (contract !== undefined) {
+    if (typeof log.address !== 'string' || log.address.toLowerCase() !== contract) return null;
+    if (!mirrorLogPosition(raw)) return null;
+    if (typeof log.block_number !== 'number' || !Number.isSafeInteger(log.block_number)) return null;
+    if (typeof log.transaction_hash !== 'string' || log.transaction_hash.length > 98) return null;
+  }
   return {
     address: log.address as string,
     data: log.data,
@@ -126,14 +179,24 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
   const attempts = Math.max(1, options.attempts ?? 3);
   const fetchImpl = options.fetchImpl ?? fetch;
   const iface = new ethers.Interface(RECORD_LANE_ABI_V38 as unknown as string[]);
+  const now = options.scan?.now ?? Date.now;
+  const maxScanRequests = options.scan?.maxRequests ?? LOG_SCAN_MAX_REQUESTS;
+  const maxKeptLogs = options.scan?.maxKeptLogs ?? LOG_SCAN_MAX_KEPT_LOGS;
+  const scanBudgetMs = LOG_SCAN_BUDGET_TIMEOUTS * timeoutMs;
 
-  /** One answer from the source: always the base and a path, never an address an answer gave. */
-  async function request(path: string, init?: RequestInit): Promise<unknown> {
+  /**
+   * One answer from the source: always the base and a path, never an address an answer gave. With `deadline`
+   * (a scan's), each attempt gets no more than what is left of it, and running out is the scan's refusal.
+   */
+  async function request(path: string, init?: RequestInit, deadline?: number): Promise<unknown> {
     const url = `${base}${path}`;
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const left = deadline === undefined ? timeoutMs : deadline - now();
+      if (left <= 0) throw mirrorRefusal.scanTooSlow(scanBudgetMs);
+      const allowed = Math.min(timeoutMs, left);
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const timer = setTimeout(() => controller.abort(), allowed);
       try {
         const response = await fetchImpl(url, { ...init, redirect: 'manual', signal: controller.signal });
         if (isMirrorRedirect(response)) {
@@ -152,7 +215,11 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
       } catch (error) {
         // A refused answer is the source's own doing: asking again would not change it.
         if (mirrorRefusalOf(error)) throw error;
-        if ((error as Error).name === 'AbortError') lastError = new Error(`mirror node request timed out after ${timeoutMs}ms (${path})`);
+        if ((error as Error).name === 'AbortError') {
+          // Cut off by what was left of the scan's time, not by a request's own timeout: the scan is over.
+          if (deadline !== undefined && allowed < timeoutMs) throw mirrorRefusal.scanTooSlow(scanBudgetMs);
+          lastError = new Error(`mirror node request timed out after ${timeoutMs}ms (${path})`);
+        }
         else if (/^mirror node \d{3} for/.test((error as Error).message) && !/^mirror node (429|5\d\d)/.test((error as Error).message)) throw error;
         else lastError = error as Error;
       } finally {
@@ -160,6 +227,7 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
       }
       if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
     }
+    if (deadline !== undefined && now() >= deadline) throw mirrorRefusal.scanTooSlow(scanBudgetMs);
     throw lastError ?? new Error(`mirror node request failed (${path})`);
   }
 
@@ -207,18 +275,27 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
     // timestamp, not block; block bounds are applied client-side as well.
     let next: string | null = `${contractLogPath(contractAddress)}?${params.toString()}`;
     const out: MirrorLog[] = [];
-    let pages = 0;
+    const scan: ScanState = { deadline: now() + scanBudgetMs, requests: 0 };
+    let last: MirrorLogPosition | null = null;
     let size = pageSize;
     while (next) {
-      const { page, asked } = await readLogPage(next, size);
+      const { page, asked } = await readLogPage(next, size, scan);
       size = Math.min(pageSize, asked * 2);
       // An answer that is no page at all (JSON null) throws here, as it always has: read as an empty page it would end a history early.
       // The same holds for `logs` that is neither a list nor absent: it throws rather than read as an empty page.
       const logs: unknown[] = Array.isArray(page.logs) ? page.logs : [...((page.logs ?? []) as Iterable<unknown>)];
       if (logs.length > asked) throw mirrorRefusal.tooManyLogs(asked, next);
       for (const raw of logs) {
-        const log = keptMirrorLog(raw);
-        if (log) out.push(log);
+        // Forward only: a log with a position must come after the last one read, so a page repeated or
+        // one that goes back ends the scan. A log without a well formed position is read past, never kept.
+        const position = mirrorLogPosition(raw);
+        if (!position) continue;
+        if (!mirrorLogFollows(last, position)) throw mirrorRefusal.notForward();
+        last = position;
+        const log = keptMirrorLog(raw, contractAddress);
+        if (!log) continue;
+        if (out.length >= maxKeptLogs) throw mirrorRefusal.scanTooManyLogs(maxKeptLogs);
+        out.push(log);
       }
       const link = page.links?.next;
       if (link === null || link === undefined || link === '') {
@@ -229,8 +306,6 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
         if (!path) throw mirrorRefusal.nextPage();
         next = withLogPageLimit(path, size);
       }
-      pages += 1;
-      if (pages > 10_000) throw new Error('mirror node log scan exceeded 10,000 pages');
     }
     return out;
   }
@@ -241,12 +316,15 @@ export function createMirrorNodeRecordChainReader(options: MirrorNodeReaderOptio
    * is still read; only a single log over the limit is refused. The scan
    * asks for the page after it at twice the size that was read, up to the
    * full size, so a run of large logs is not asked for from the top each page.
+   * Every ask counts toward the scan's request stop and runs inside its time.
    */
-  async function readLogPage(path: string, start: number): Promise<{ page: MirrorLogsPage; asked: number }> {
+  async function readLogPage(path: string, start: number, scan: ScanState): Promise<{ page: MirrorLogsPage; asked: number }> {
     let asked = start;
     for (;;) {
+      if (scan.requests >= maxScanRequests) throw mirrorRefusal.scanTooManyRequests(maxScanRequests);
+      scan.requests += 1;
       try {
-        return { page: (await request(withLogPageLimit(path, asked))) as MirrorLogsPage, asked };
+        return { page: (await request(withLogPageLimit(path, asked), undefined, scan.deadline)) as MirrorLogsPage, asked };
       } catch (error) {
         if (mirrorRefusalOf(error) !== 'too-large' || asked <= 1) throw error;
         asked = Math.max(1, Math.floor(asked / 2));

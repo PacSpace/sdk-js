@@ -1,5 +1,5 @@
 import type { MirrorRefusalCode } from '@pacspace/shared';
-import { checkHistory, HistoryFileError, parseHistoryFile, type CheckOptions } from './check';
+import { checkHistoryWithFacts, HistoryFileError, parseHistoryFile, type CheckOptions } from './check';
 import { refusedOf, SOURCE_REFUSAL_REASONS } from './report';
 
 export const RELEASES_SCHEMA = 'pacspace-releases/v1';
@@ -359,13 +359,14 @@ async function checkPinned(
     base.commit = manifest.commit;
 
     let report;
+    let entriesMatch;
     try {
-      report = await checkHistory(history, {
+      ({ report, entriesMatch } = await checkHistoryWithFacts(history, {
         source: source ?? 'mirror',
         timeoutMs,
         fetchImpl,
         heldFile: { sha256: await sha256Hex(manifestRead.bytes), byteLength: String(manifestRead.bytes.length) },
-      });
+      }));
     } catch (error) {
       if (error instanceof HistoryFileError) return differs([{ kind: 'differs', path: historyPath }]);
       throw error;
@@ -373,7 +374,8 @@ async function checkPinned(
     if (report.exitCode === 3 || (report.source.compared === false && report.source.reason === 'unreachable')) {
       return unreachable(refusedOf(report.source));
     }
-    if (!report.passed) return differs([{ kind: 'differs', path: historyPath }]);
+    // The history's own entries, not the report's `passed`: a manifest the latest entry does not name yet is told apart below.
+    if (!entriesMatch) return differs([{ kind: 'differs', path: historyPath }]);
     const latest = report.record.entries;
     base.latestEntry = latest;
     const matched = report.heldFile?.entries ?? [];

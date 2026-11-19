@@ -131,13 +131,13 @@ if (report.exitCode !== 0) process.exitCode = report.exitCode;
 `report` is a `pacspace-check-report/v1` document: the record's count and
 the entries that matched, were missing, or did not match; whether the file
 is intact; what the proof layer said; the daily statement's outcome; the
-fingerprint comparison; and the sentences printed above.
+fingerprint comparison; and the sentences printed above. `passed` is true only when the report's `exitCode` is 0.
 
 ## What it needs
 
 Node.js 20.19 or later, and the network, for the proof layer. open reads the record from the link's host, and release reads the key pages from the host it checks. Checking a file sends nothing to PacSpace. Where a record was committed is named inside the history
 file; `--source` and `--rpc` point the checker at a mirror or endpoint of
-your own. A redirect from a source is not followed. Pass the address it leads to; a source given as `http://` usually needs `https://`. When a report says the proof layer was not read because of its source, name another source, or read without a mirror with `--rpc <url>`.
+your own. A redirect from a source is not followed. Pass the address it leads to; a source given as `http://` usually needs `https://`. When a report says the proof layer was not read because of its source, name another source, or read without a mirror with `--rpc <url>`. The same holds for `--rpc`: a redirect is not followed, and an answer larger than 1 MiB is not read. Reading a contract's whole log, as `--full` does, is given sixty times the timeout in all, ten minutes by default; a report that says its source did not finish in the time allowed can be run again with a larger `--timeout`. Over `--rpc` such a read goes through the chain from its first block, which on a public network takes far longer than that.
 
 ## License
 

@@ -1,10 +1,20 @@
 # Changelog
 
+## 0.5.6 - 2026-11-18
+
+### Security
+
+- `--rpc` holds its endpoint to its own address: a redirect is not followed. An answer larger than 1 MiB is not read; a log range that large is asked again in smaller ranges. A 429 is retried three times at most, and never waited on longer than the timeout. Reading a contract's whole log now ends after sixty times the timeout in all (ten minutes by default), and pages must move forward. With any of these the report says the proof layer was not read, and why, with the exit code for a proof layer that could not be reached. An `--rpc` address given as `http://` that redirects to `https://` must now be given as `https://`.
+
+### Changed
+
+- `passed`, in `--json` and in the result `checkHistory()` returns, is true only when the report's `exitCode` is 0. Before, it could be true beside exit code 3 (the proof layer was not read) and beside exit code 1 (the file you hold was not matched, or a statement or its fingerprint does not match).
+
 ## 0.5.5 - 2026-11-17
 
 ### Security
 
-- Reads from a mirror (the default source or `--source <url>`) hold the source to its own address: a redirect is not followed, and a next page is read only from the same source and the same contract's log. A page with more logs than were asked for is not read. A page larger than 1 MiB is asked for again in smaller pages, and a single answer larger than 1 MiB is not read. With a source that does any of these the report says the proof layer was not read, and why, and the exit code is the one for a proof layer that could not be reached. A source given as `http://` that redirects to `https://` must now be given as `https://`. The list of where each entry was committed reads its pages under the same limits.
+- Reads from a mirror (the default source or `--source <url>`) hold the source to its own address: a redirect is not followed, and a next page is read only from the same source and the same contract's log. A page with more logs than were asked for is not read. A page larger than 1 MiB is asked for again in smaller pages, and a single answer larger than 1 MiB is not read. With a source that does any of these the report says the proof layer was not read, and why, and the exit code is the one for a proof layer that could not be reached. A source given as `http://` that redirects to `https://` is refused, and the report says why; give it as `https://`. With 0.5.4 such a source on the public mirrors already ended with exit code 3, without a reason. The list of where each entry was committed reads its pages under the same limits.
 
 ## 0.5.4 - 2026-11-16
 

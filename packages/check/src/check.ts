@@ -50,10 +50,11 @@ import {
   type SlotVerificationLevel,
 } from '@pacspace/shared';
 import {
-  buildReport,
-  buildSealsReport,
+  buildReportWithFacts,
+  buildSealsReportWithFacts,
   sameHex,
   type CheckReport,
+  type ReportWithFacts,
   type DailyStatementOutcome,
   type DisclosureOutcome,
   type HeldFileOutcome,
@@ -290,13 +291,15 @@ function readerFor(
  * lookup that fails, hangs or answers nonsense adds only `writes: { read: false }`.
  */
 async function withWrites(
-  report: CheckReport,
+  checked: ReportWithFacts,
   bundle: { recordKey?: unknown; chain?: { chainId?: unknown; contractAddress?: unknown }; receipts?: unknown; exportedAt?: unknown },
   verification: BundleVerificationV1,
   reader: RecordChainReader | null,
   options: CheckOptions,
-): Promise<CheckReport> {
-  if (!options.writes || !reader || !report.passed || !report.file.intact || !report.source.compared || !report.source.matches) return report;
+): Promise<ReportWithFacts> {
+  const { report } = checked;
+  // The lookup follows the entries, not the verdict as asked: a held file that was not matched does not stop it.
+  if (!options.writes || !reader || !checked.entriesMatch || !report.file.intact || !report.source.compared || !report.source.matches) return checked;
   let writes: CheckReport['writes'];
   try {
     const source = options.source ?? 'mirror';
@@ -316,7 +319,7 @@ async function withWrites(
   } catch {
     writes = { read: false, reason: 'unreachable' };
   }
-  return { ...report, writes };
+  return { ...checked, report: { ...report, writes } };
 }
 
 const PAYLOAD_POINTER = /^\/payloads\/(0|[1-9][0-9]*)$/;
@@ -376,6 +379,14 @@ function refuseLayoutNotRead(result: { code?: string }): void {
  * Nothing is sent to PacSpace.
  */
 export async function checkHistory(file: HistoryFile, options: CheckOptions = {}): Promise<CheckReport> {
+  return (await checkHistoryWithFacts(file, options)).report;
+}
+
+/**
+ * `checkHistory`, with the narrower fact beside the report (`ReportWithFacts`). Internal: the package's entry
+ * point does not export it. `release` and `evidence` read `entriesMatch` where they once read `passed`.
+ */
+export async function checkHistoryWithFacts(file: HistoryFile, options: CheckOptions = {}): Promise<ReportWithFacts> {
   if (options.source === 'offline' && needsLedgerRoots(file)) throw new HistoryFileError(DISCLOSURE_OFFLINE_SENTENCE);
   if (options.heldFile && !revealsFileFingerprint(file)) throw new HistoryFileError(NOTHING_REVEALED_SENTENCE);
   if (options.recordKey && file.schema !== RECORD_HISTORY_BUNDLE_SCHEMA_V3) throw new HistoryFileError(KEY_ONLY_FOR_ENCRYPTED_SENTENCE);
@@ -495,7 +506,7 @@ async function verifyBundleV2WithSource(
   };
 }
 
-async function checkBundle(file: HistoryFile, options: CheckOptions): Promise<CheckReport> {
+async function checkBundle(file: HistoryFile, options: CheckOptions): Promise<ReportWithFacts> {
   const bundle = asBundle(file);
   const v2 = file.schema === RECORD_HISTORY_BUNDLE_SCHEMA_V2;
   const layouts = getPublishedLayoutRegistry();
@@ -522,7 +533,7 @@ async function checkBundle(file: HistoryFile, options: CheckOptions): Promise<Ch
 
   if (options.source === 'offline' || !offline.schemaOk || !offline.digestOk) {
     // A file that is not a history, or was changed, is not taken to the source.
-    return buildReport({
+    return buildReportWithFacts({
       ...base,
       verification: offline,
       source: { compared: false, reason: 'offline' },
@@ -568,7 +579,7 @@ async function checkBundle(file: HistoryFile, options: CheckOptions): Promise<Ch
     source = notReached(error);
   }
 
-  const report = buildReport({
+  const report = buildReportWithFacts({
     ...base,
     verification,
     source,
@@ -602,7 +613,7 @@ function encryptedRefusalSentence(refusal: EncryptedReadRefusalV1): string | nul
  * before the seal checks, then, unless offline, the same reads from the
  * proof layer as a v2 history. The key stays in this function.
  */
-async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, recordKey: RecordKeyV1, options: CheckOptions): Promise<CheckReport> {
+async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, recordKey: RecordKeyV1, options: CheckOptions): Promise<ReportWithFacts> {
   const receipts: unknown[] = Array.isArray(bundle?.receipts) ? bundle.receipts : [];
   const format2 = receipts.every((r) => ['semantic-receipt/v5', 'semantic-receipt/v6'].includes((r as { schema?: unknown })?.schema as string));
   if (!format2) throw new HistoryFileError(EARLIER_ENCRYPTED_FORMAT_SENTENCE);
@@ -624,10 +635,10 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
     exportedAt: typeof bundle?.exportedAt === 'string' ? bundle.exportedAt : null,
     statementFingerprint: options.statementFingerprint?.trim() || null,
   };
-  const refused = (refusal: EncryptedReadRefusalV1): CheckReport => {
+  const refused = (refusal: EncryptedReadRefusalV1): ReportWithFacts => {
     refuseLayoutNotRead(refusal);
     if (refusal.code === 'RECORD_HISTORY_DIGEST') {
-      return buildReport({
+      return buildReportWithFacts({
         ...base,
         verification: { verified: false, digestOk: false, reason: '', history: null },
         source: { compared: false, reason: 'offline' },
@@ -636,7 +647,7 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
     }
     const sentence = encryptedRefusalSentence(refusal);
     if (sentence === null) throw new HistoryFileError(notThisForm);
-    return buildReport({
+    return buildReportWithFacts({
       ...base,
       verification: { verified: false, digestOk: true, reason: sentence, history: null },
       source: { compared: false, reason: 'offline' },
@@ -654,7 +665,7 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
   if (!offline.ok) return refused(offline);
   const encrypted = { refusedUnopened: offline.refused.filter((r) => !r.opened).length };
   if (options.source === 'offline' || !offline.verification.schemaOk || !offline.verification.digestOk) {
-    return buildReport({
+    return buildReportWithFacts({
       ...base,
       verification: offline.verification,
       source: { compared: false, reason: 'offline' },
@@ -710,7 +721,7 @@ async function checkEncrypted(file: HistoryFile, bundle: RecordHistoryBundleV3, 
     source = notReached(error);
   }
 
-  const report = buildReport({
+  const report = buildReportWithFacts({
     ...base,
     verification: result.verification,
     source,
@@ -826,7 +837,7 @@ async function checkSeals(
   form: RecordSealHistoryV1,
   disclosure: RecordDisclosure | null,
   options: CheckOptions,
-): Promise<CheckReport> {
+): Promise<ReportWithFacts> {
   const layouts = getPublishedLayoutRegistry();
   let verification: SealHistoryVerificationV1 = verifyRecordSealHistoryV1(form, { layouts });
   refuseLayoutNotRead(verification);
@@ -852,7 +863,7 @@ async function checkSeals(
   const entries = entryCountOf(form, layouts);
 
   if (options.source === 'offline' || !verification.schemaOk || !verification.digestOk) {
-    return buildSealsReport({
+    return buildSealsReportWithFacts({
       ...base,
       entries,
       verification,
@@ -896,7 +907,7 @@ async function checkSeals(
     ? heldFileOutcome(options.heldFile, disclosureOutcome?.kind === 'verified' ? disclosureOutcome.payloads : [], false)
     : null;
 
-  return buildSealsReport({
+  return buildSealsReportWithFacts({
     ...base,
     entries,
     verification,
